@@ -22,7 +22,7 @@ for _sdk_path in _candidates:
         sys.path.insert(0, str(_sdk_path))
 
 try:
-    from soarmMoce_sdk.kinematics import RobotModel
+    from soarmMoce_sdk.kinematics import RobotModel, fk, matrix_to_rpy, solve_ik
     from soarmMoce_sdk.kinematics.frames import (
         transform_from_xyz_rpy,
         transform_rot,
@@ -33,6 +33,9 @@ except Exception as e:
 
 __all__ = [
     "RobotModel",
+    "fk",
+    "matrix_to_rpy",
+    "solve_ik",
     "transform_from_xyz_rpy",
     "transform_rot",
     "transform_trans",

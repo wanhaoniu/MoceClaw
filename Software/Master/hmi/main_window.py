@@ -160,6 +160,11 @@ class ArmControlGUI(QMainWindow):
         self.sim_q = np.zeros(0, dtype=float)
         self._sim_fk = None
         self._sim_matrix_to_rpy = None
+        self._sim_solve_ik = None
+        self._jog_hold_timer = QTimer(self)
+        self._jog_hold_timer.setInterval(100)
+        self._jog_hold_timer.timeout.connect(self._on_quick_jog_hold_tick)
+        self._jog_hold_key = None
 
         self.last_frame = None
         self.last_frame_fps = 0.0
@@ -664,6 +669,14 @@ class ArmControlGUI(QMainWindow):
             minus_btn.clicked.connect(partial(self._on_quick_joint_step, idx, -1.0))
             plus_btn.clicked.connect(partial(self._on_quick_joint_step, idx, 1.0))
 
+        for key, btn in self.quick_page.jog_buttons.items():
+            btn.clicked.connect(partial(self._on_quick_jog_clicked, key))
+            btn.pressed.connect(partial(self._on_quick_jog_pressed, key))
+            btn.released.connect(self._on_quick_jog_released)
+
+        self.quick_page.goto_origin_btn.clicked.connect(self._on_quick_origin)
+        self.quick_page.free_move_btn.clicked.connect(self._on_quick_free_move)
+
     def setup_timers(self):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status)
@@ -821,6 +834,295 @@ class ArmControlGUI(QMainWindow):
         lo, hi = self._sim_limits[idx]
         self.sim_q[idx] = float(np.clip(self.sim_q[idx] + delta, lo, hi))
         self._update_sim_plot()
+
+    def _quick_jog_mode_is_continuous(self) -> bool:
+        combo = getattr(self.quick_page, "step_mode_combo", None)
+        if combo is None:
+            return False
+        if int(combo.currentIndex()) == 1:
+            return True
+        return str(combo.currentText()).strip().lower() in {"continuous", "连续"}
+
+    def _on_quick_jog_pressed(self, key: str):
+        if not self._quick_jog_mode_is_continuous():
+            return
+        self._jog_hold_key = str(key)
+        self._apply_quick_cartesian_jog(self._jog_hold_key)
+        self._jog_hold_timer.start()
+
+    def _on_quick_jog_released(self):
+        self._jog_hold_key = None
+        if self._jog_hold_timer.isActive():
+            self._jog_hold_timer.stop()
+
+    def _on_quick_jog_clicked(self, key: str):
+        if self._quick_jog_mode_is_continuous():
+            return
+        self._apply_quick_cartesian_jog(str(key))
+
+    def _on_quick_jog_hold_tick(self):
+        if not self._jog_hold_key:
+            self._jog_hold_timer.stop()
+            return
+        self._apply_quick_cartesian_jog(self._jog_hold_key)
+
+    @staticmethod
+    def _rpy_to_rotmat(rpy: np.ndarray) -> np.ndarray:
+        roll, pitch, yaw = [float(x) for x in np.asarray(rpy, dtype=float).reshape(3)]
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=float)
+        ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=float)
+        rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+        return rz @ ry @ rx
+
+    @staticmethod
+    def _rotvec_to_rotmat(rotvec: np.ndarray) -> np.ndarray:
+        rv = np.asarray(rotvec, dtype=float).reshape(3)
+        angle = float(np.linalg.norm(rv))
+        if angle < 1e-12:
+            return np.eye(3, dtype=float)
+        axis = rv / angle
+        x, y, z = float(axis[0]), float(axis[1]), float(axis[2])
+        c = math.cos(angle)
+        s = math.sin(angle)
+        v = 1.0 - c
+        return np.array(
+            [
+                [x * x * v + c, x * y * v - z * s, x * z * v + y * s],
+                [y * x * v + z * s, y * y * v + c, y * z * v - x * s],
+                [z * x * v - y * s, z * y * v + x * s, z * z * v + c],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _rotmat_to_rpy(rotmat: np.ndarray) -> np.ndarray:
+        R = np.asarray(rotmat, dtype=float).reshape(3, 3)
+        sy = -float(R[2, 0])
+        sy = float(np.clip(sy, -1.0, 1.0))
+        cy = float(max(0.0, 1.0 - sy * sy) ** 0.5)
+        if cy < 1e-9:
+            yaw = math.atan2(-float(R[0, 1]), float(R[1, 1]))
+            pitch = math.asin(sy)
+            roll = 0.0
+        else:
+            yaw = math.atan2(float(R[1, 0]), float(R[0, 0]))
+            pitch = math.asin(sy)
+            roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
+        return np.array([roll, pitch, yaw], dtype=float)
+
+    @staticmethod
+    def _normalize_jog_key(key: str) -> str:
+        key_norm = str(key).strip().upper().replace(" ", "")
+        alias = {
+            "+U": "+RX",
+            "-U": "-RX",
+            "+V": "+RY",
+            "-V": "-RY",
+            "+W": "+RZ",
+            "-W": "-RZ",
+        }
+        return alias.get(key_norm, key_norm)
+
+    def _solve_pybullet_ik(
+        self,
+        client_id: int,
+        robot_id: int,
+        joint_indices,
+        limits,
+        ee_link_idx: int,
+        target_xyz: np.ndarray,
+        target_rpy: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        if not PYBULLET_AVAILABLE:
+            return None
+        if ee_link_idx is None:
+            return None
+        if not joint_indices:
+            return None
+
+        lower = [float(lo) for lo, _ in limits]
+        upper = [float(hi) for _, hi in limits]
+        ranges = [max(1e-4, float(hi - lo)) for lo, hi in limits]
+        rest = [float(self.sim_q[i]) if i < len(self.sim_q) else 0.0 for i in range(len(joint_indices))]
+        target_quat = _pb.getQuaternionFromEuler([float(target_rpy[0]), float(target_rpy[1]), float(target_rpy[2])])
+
+        try:
+            q_full = _pb.calculateInverseKinematics(
+                robot_id,
+                int(ee_link_idx),
+                targetPosition=[float(target_xyz[0]), float(target_xyz[1]), float(target_xyz[2])],
+                targetOrientation=target_quat,
+                lowerLimits=lower,
+                upperLimits=upper,
+                jointRanges=ranges,
+                restPoses=rest,
+                maxNumIterations=160,
+                residualThreshold=1e-5,
+                physicsClientId=client_id,
+            )
+        except Exception:
+            return None
+
+        q_vals = list(q_full) if q_full is not None else []
+        q_out = np.array(rest, dtype=float)
+        for i, ji in enumerate(joint_indices):
+            if ji < len(q_vals):
+                raw = float(q_vals[ji])
+            elif i < len(q_vals):
+                raw = float(q_vals[i])
+            else:
+                raw = float(q_out[i])
+            lo, hi = limits[i]
+            q_out[i] = float(np.clip(raw, float(lo), float(hi)))
+        return q_out
+
+    def _solve_sim_ik(self, target_xyz: np.ndarray, target_rpy: np.ndarray) -> Optional[np.ndarray]:
+        if self._sim_backend == "pybullet":
+            if self._sim_pb_client is None or self._sim_pb_robot_id is None:
+                return None
+            ee_idx = self._sim_pb_ee_link_index
+            if ee_idx is None:
+                ee_idx = self._detect_pybullet_ee_link(self._sim_pb_client, self._sim_pb_robot_id)
+                self._sim_pb_ee_link_index = ee_idx
+            return self._solve_pybullet_ik(
+                self._sim_pb_client,
+                self._sim_pb_robot_id,
+                self._sim_pb_joint_indices,
+                self._sim_limits,
+                ee_idx,
+                target_xyz,
+                target_rpy,
+            )
+
+        if self._sim_backend == "vtk" and self.sim_vtk_view is not None:
+            client_id = getattr(self.sim_vtk_view, "pb_client", None)
+            robot_id = getattr(self.sim_vtk_view, "pb_robot_id", None)
+            joint_indices = list(getattr(self.sim_vtk_view, "joint_indices", []))
+            limits = list(getattr(self.sim_vtk_view, "joint_limits", []))
+            ee_idx = getattr(self.sim_vtk_view, "_ee_link_index", None)
+            if client_id is None or robot_id is None or not joint_indices or not limits:
+                return None
+            if ee_idx is None:
+                ee_idx = self._detect_pybullet_ee_link(client_id, robot_id)
+                setattr(self.sim_vtk_view, "_ee_link_index", ee_idx)
+            return self._solve_pybullet_ik(
+                int(client_id),
+                int(robot_id),
+                joint_indices,
+                limits,
+                ee_idx,
+                target_xyz,
+                target_rpy,
+            )
+
+        if self._sim_backend == "kinematics":
+            if self.sim_robot is None or self._sim_solve_ik is None:
+                return None
+            try:
+                sol = self._sim_solve_ik(
+                    self.sim_robot,
+                    np.asarray(target_xyz, dtype=float),
+                    np.asarray(target_rpy, dtype=float),
+                    q0=np.asarray(self.sim_q, dtype=float),
+                    max_iters=180,
+                    pos_tol=2e-3,
+                    rot_tol=2e-2,
+                )
+            except Exception:
+                return None
+
+            q_out = np.asarray(sol.q, dtype=float).copy()
+            if q_out.shape[0] != len(self._sim_limits):
+                return None
+            for i, (lo, hi) in enumerate(self._sim_limits):
+                q_out[i] = float(np.clip(q_out[i], float(lo), float(hi)))
+            if not sol.success and (float(sol.pos_err) > 0.03 or float(sol.rot_err) > 0.30):
+                return None
+            return q_out
+
+        return None
+
+    def _apply_quick_cartesian_jog(self, key: str):
+        if not self._sim_ready or len(self.sim_q) == 0:
+            return
+
+        key_norm = self._normalize_jog_key(key)
+        trans_map = {
+            "+X": np.array([1.0, 0.0, 0.0], dtype=float),
+            "-X": np.array([-1.0, 0.0, 0.0], dtype=float),
+            "+Y": np.array([0.0, 1.0, 0.0], dtype=float),
+            "-Y": np.array([0.0, -1.0, 0.0], dtype=float),
+            "+Z": np.array([0.0, 0.0, 1.0], dtype=float),
+            "-Z": np.array([0.0, 0.0, -1.0], dtype=float),
+        }
+        rot_map = {
+            "+RX": np.array([1.0, 0.0, 0.0], dtype=float),
+            "-RX": np.array([-1.0, 0.0, 0.0], dtype=float),
+            "+RY": np.array([0.0, 1.0, 0.0], dtype=float),
+            "-RY": np.array([0.0, -1.0, 0.0], dtype=float),
+            "+RZ": np.array([0.0, 0.0, 1.0], dtype=float),
+            "-RZ": np.array([0.0, 0.0, -1.0], dtype=float),
+        }
+        if key_norm not in trans_map and key_norm not in rot_map:
+            return
+
+        pose = self._get_sim_pose_xyzrpy()
+        if pose is None:
+            return
+        xyz_now, rpy_now = pose
+        R_now = self._rpy_to_rotmat(rpy_now)
+
+        step_mm = max(0.1, float(self.quick_page.step_dist_spin.value()))
+        step_rad = math.radians(max(0.1, float(self.quick_page.step_angle_spin.value())))
+        delta_pos_local = np.zeros(3, dtype=float)
+        delta_rot_local = np.zeros(3, dtype=float)
+        if key_norm in trans_map:
+            delta_pos_local = trans_map[key_norm] * (step_mm / 1000.0)
+        else:
+            delta_rot_local = rot_map[key_norm] * step_rad
+
+        coord_mode = str(self.quick_page.coord_combo.currentText()).strip().lower()
+        use_tool = coord_mode.startswith("tool")
+        if use_tool:
+            target_xyz = np.asarray(xyz_now, dtype=float) + (R_now @ delta_pos_local)
+            R_target = R_now @ self._rotvec_to_rotmat(delta_rot_local)
+        else:
+            target_xyz = np.asarray(xyz_now, dtype=float) + delta_pos_local
+            R_target = self._rotvec_to_rotmat(delta_rot_local) @ R_now
+        target_rpy = self._rotmat_to_rpy(R_target)
+
+        q_target = self._solve_sim_ik(target_xyz, target_rpy)
+        if q_target is None:
+            return
+        if q_target.shape[0] != len(self.sim_q):
+            return
+
+        q_clipped = np.asarray(q_target, dtype=float).copy()
+        for i, (lo, hi) in enumerate(self._sim_limits):
+            q_clipped[i] = float(np.clip(q_clipped[i], float(lo), float(hi)))
+        self.sim_q = q_clipped
+        self._update_sim_plot()
+
+    def _on_quick_origin(self):
+        if not self._sim_ready:
+            return
+        self._on_quick_jog_released()
+        self._on_sim_reset()
+        self.statusBar().showMessage("Simulation reset to zero")
+
+    def _on_quick_free_move(self):
+        combo = getattr(self.quick_page, "step_mode_combo", None)
+        if combo is None:
+            return
+        next_idx = 0 if int(combo.currentIndex()) == 1 else 1
+        combo.setCurrentIndex(next_idx)
+        if next_idx == 1:
+            self.statusBar().showMessage("Jog mode: Continuous")
+        else:
+            self.statusBar().showMessage("Jog mode: Step")
 
     def _sync_quick_joint_panel(self):
         for idx, (name_label, _minus_btn, value_label, _plus_btn) in enumerate(self.quick_page.joint_rows):
@@ -1096,13 +1398,19 @@ class ArmControlGUI(QMainWindow):
         self._update_global_status_bar()
 
     def on_home(self):
+        if not self.client:
+            if self._sim_ready:
+                self._on_sim_reset()
+                self.statusBar().showMessage("Simulation reset to zero")
+            return
+
         reply = QMessageBox.question(
             self,
             self._tr("msg_confirm"),
             self._tr("msg_confirm_home"),
             QMessageBox.Yes | QMessageBox.No,
         )
-        if reply != QMessageBox.Yes or not self.client:
+        if reply != QMessageBox.Yes:
             return
 
         self.log(self._tr("log_home_start"))
@@ -1566,7 +1874,7 @@ class ArmControlGUI(QMainWindow):
             try:
                 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
                 from matplotlib.figure import Figure
-                from ik_solver import RobotModel, fk, matrix_to_rpy, transform_from_xyz_rpy, transform_rot, transform_trans
+                from ik_solver import RobotModel, fk, matrix_to_rpy, solve_ik, transform_from_xyz_rpy, transform_rot, transform_trans
                 self.sim_view_label.hide()
                 self.sim_canvas = FigureCanvas(Figure(figsize=(4, 3), tight_layout=True))
                 self.sim_ax = self.sim_canvas.figure.add_subplot(111, projection="3d")
@@ -1584,6 +1892,7 @@ class ArmControlGUI(QMainWindow):
             self._sim_tf_trans = transform_trans
             self._sim_fk = fk
             self._sim_matrix_to_rpy = matrix_to_rpy
+            self._sim_solve_ik = solve_ik
             self.sim_robot = RobotModel(urdf_path)
             self._sim_backend = "kinematics"
             self.sim_joint_names = []
@@ -1816,6 +2125,8 @@ class ArmControlGUI(QMainWindow):
         self.sim_view_label.setPixmap(QPixmap.fromImage(qimg))
 
     def _cleanup_sim_backend(self):
+        self._on_quick_jog_released()
+
         if self.sim_vtk_view is not None:
             try:
                 self.sim_vtk_view.shutdown()
@@ -1836,6 +2147,7 @@ class ArmControlGUI(QMainWindow):
         self._sim_pb_renderer_fallback_done = False
         self._sim_fk = None
         self._sim_matrix_to_rpy = None
+        self._sim_solve_ik = None
 
     def _update_sim_plot(self):
         if not self._sim_ready:
