@@ -4,3 +4,5 @@
 *.sldprt
 *.sldasm
 ~$*
+
+.DS_Store
