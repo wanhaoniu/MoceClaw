@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta:__legacy__"
+
+[project]
+name = "soarmMoce-sdk"
+version = "0.1.0"
+description = "SoarmMoce Python SDK (minimal)"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{name = "SoarmMoce"}]
+license = {text = "MIT"}
+keywords = ["robot", "arm", "ik", "sdk"]
+
+dependencies = [
+  "numpy>=1.21",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+sim = ["pybullet"]
+dev = ["pytest", "black", "ruff"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+soarmMoce_sdk = ["resources/**"]

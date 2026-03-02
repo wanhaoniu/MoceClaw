@@ -1,0 +1,31 @@
+transport:
+  type: mock
+  port: /dev/ttyACM0
+  baudrate: 115200
+  host: 192.168.66.130
+  timeout: 2.0
+
+urdf:
+  path: "pkg://soarmMoce_sdk/resources/urdf/soarmoce_urdf.urdf"
+
+meshes:
+  path: "pkg://soarmMoce_sdk/resources/meshes"
+
+calibration:
+  path: ""
+
+control:
+  hz: 100
+  timeout: 2.0
+
+protocol:
+  unit: deg
+  max_retries: 1
+  use_seq: false
+  sdk_to_server_map:
+    shoulder: shoulder_pan
+    shoulder_lift: shoulder_lift
+    elbow: elbow_flex
+    wrist: wrist_flex
+    wrist_roll: wrist_roll
+    gripper: gripper

@@ -1,1 +1,6 @@
-.DS_Store
+# SolidWorks files
+*.SLDPRT
+*.SLDASM
+*.sldprt
+*.sldasm
+~$*

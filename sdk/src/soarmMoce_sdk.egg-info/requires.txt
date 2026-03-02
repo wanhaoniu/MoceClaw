@@ -1,0 +1,10 @@
+numpy>=1.21
+pyyaml>=6.0
+
+[dev]
+pytest
+black
+ruff
+
+[sim]
+pybullet
