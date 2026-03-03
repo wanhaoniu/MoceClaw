@@ -1,0 +1,123 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "move_robot_arm",
+      "description": "Move robot TCP in Cartesian space.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "target x in meters, base frame"
+          },
+          "y": {
+            "type": "number",
+            "description": "target y in meters, base frame"
+          },
+          "z": {
+            "type": "number",
+            "description": "target z in meters, base frame"
+          },
+          "frame": {
+            "type": "string",
+            "enum": [
+              "base",
+              "tool"
+            ],
+            "default": "base"
+          },
+          "duration": {
+            "type": "number",
+            "minimum": 0.2,
+            "maximum": 20.0,
+            "default": 2.0
+          },
+          "wait": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "z"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_robot_state",
+      "description": "Read robot connection and kinematic state.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_camera_frame",
+      "description": "Capture one frame from simulation camera.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "eye_in_hand",
+              "scene"
+            ],
+            "default": "eye_in_hand"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 160,
+            "maximum": 1920,
+            "default": 960
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 120,
+            "maximum": 1080,
+            "default": 720
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "jpg",
+              "png"
+            ],
+            "default": "jpg"
+          },
+          "return_mode": {
+            "type": "string",
+            "enum": [
+              "path",
+              "base64"
+            ],
+            "default": "path"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "stop_robot",
+      "description": "Immediately stop current robot action.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  }
+]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "MoceArm OpenClaw Control"
+  short_description: "Simulation-first tool calling for SO-ARM-MoceArm"
+  default_prompt: "Use $mocearm-openclaw-control to execute safe SO-ARM-MoceArm tool calls in meters and inspect camera frames."
