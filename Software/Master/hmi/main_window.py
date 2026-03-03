@@ -9,9 +9,10 @@ import os
 import sys
 import threading
 import time
+import base64
 from functools import partial
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -1375,8 +1376,12 @@ class ArmControlGUI(QMainWindow):
                 self.speech_window.agent_reply_ready.connect(self._on_speech_agent_reply_ready)
             if hasattr(self.speech_window, "agent_failed"):
                 self.speech_window.agent_failed.connect(self._on_speech_agent_failed)
+            if hasattr(self.speech_window, "agent_action_started"):
+                self.speech_window.agent_action_started.connect(self._on_speech_agent_action_started)
             if hasattr(self.speech_window, "agent_session_changed"):
                 self.speech_window.agent_session_changed.connect(self._on_speech_agent_session_changed)
+            if hasattr(self.speech_window, "tool_request"):
+                self.speech_window.tool_request.connect(self._on_speech_tool_request)
         return self.speech_window
 
     def _on_speech_window_closed(self):
@@ -1407,10 +1412,200 @@ class ArmControlGUI(QMainWindow):
         self.log(f"[OpenClaw] {msg}", "error")
         self.statusBar().showMessage(msg)
 
+    def _on_speech_agent_action_started(self, action_name: str):
+        action = str(action_name or "").strip() or "unknown"
+        self.log(f"[OpenClaw] 正在执行动作: {action}", "info")
+        self.statusBar().showMessage(f"正在执行动作: {action}...")
+
     def _on_speech_agent_session_changed(self, session_id: str):
         sid = str(session_id or "").strip()
         if sid:
             self.log(f"[OpenClaw] Session: {sid}", "info")
+
+    @staticmethod
+    def _tool_to_float(value, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _tool_to_int(value, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _tool_move_robot_arm_main_thread(self, payload: Dict[str, object]) -> Tuple[bool, Dict[str, object]]:
+        if not self._sim_ready:
+            return False, {"ok": False, "error": "simulation is not ready"}
+
+        pose = self._get_sim_pose_xyzrpy()
+        if pose is None:
+            return False, {"ok": False, "error": "failed to read current pose"}
+        xyz_now, rpy_now = pose
+
+        x = self._tool_to_float(payload.get("x", 0.0), float(xyz_now[0]))
+        y = self._tool_to_float(payload.get("y", 0.0), float(xyz_now[1]))
+        z = self._tool_to_float(payload.get("z", 0.0), float(xyz_now[2]))
+        frame = str(payload.get("frame", "base") or "base").strip().lower()
+        duration = max(0.2, min(20.0, self._tool_to_float(payload.get("duration", 2.0), 2.0)))
+        wait = bool(payload.get("wait", True))
+
+        if frame not in ("base", "tool"):
+            return False, {"ok": False, "error": "frame must be 'base' or 'tool'"}
+
+        target_xyz = np.array([x, y, z], dtype=float)
+        if frame == "tool":
+            # Tool frame mode treats input xyz as local offset in meters.
+            R_now = self._rpy_to_rotmat(np.asarray(rpy_now, dtype=float))
+            target_xyz = np.asarray(xyz_now, dtype=float) + (R_now @ target_xyz)
+
+        target_rpy = np.asarray(rpy_now, dtype=float)
+        q_target = self._solve_sim_ik(np.asarray(target_xyz, dtype=float), target_rpy)
+        if q_target is None:
+            return False, {"ok": False, "error": "IK failed for target", "target_xyz_m": target_xyz.tolist()}
+        if q_target.shape[0] != len(self.sim_q):
+            return False, {"ok": False, "error": "joint vector size mismatch"}
+
+        q_clipped = np.asarray(q_target, dtype=float).copy()
+        for i, (lo, hi) in enumerate(self._sim_limits):
+            q_clipped[i] = float(np.clip(q_clipped[i], float(lo), float(hi)))
+        self.sim_q = q_clipped
+        self._update_sim_plot()
+
+        pose_after = self._get_sim_pose_xyzrpy()
+        if pose_after is None:
+            return False, {"ok": False, "error": "failed to read pose after move"}
+        xyz_after, rpy_after = pose_after
+        err = float(np.linalg.norm(np.asarray(xyz_after, dtype=float) - np.asarray(target_xyz, dtype=float)))
+
+        result = {
+            "ok": err <= 0.10,
+            "message": "moved" if err <= 0.10 else "move completed with large error",
+            "backend": f"main-thread-{self._sim_backend}",
+            "frame": frame,
+            "duration": duration,
+            "wait": wait,
+            "target_xyz_m": [float(v) for v in target_xyz.tolist()],
+            "actual_xyz_m": [float(v) for v in np.asarray(xyz_after, dtype=float).tolist()],
+            "actual_rpy_rad": [float(v) for v in np.asarray(rpy_after, dtype=float).tolist()],
+            "position_error_m": err,
+            "joint_values_rad": [float(v) for v in np.asarray(self.sim_q, dtype=float).tolist()],
+        }
+        return bool(result["ok"]), result
+
+    def _tool_get_robot_state_main_thread(self) -> Tuple[bool, Dict[str, object]]:
+        pose = self._get_sim_pose_xyzrpy()
+        if pose is None:
+            return False, {"ok": False, "error": "failed to read robot pose"}
+        xyz, rpy = pose
+
+        joints: Dict[str, float] = {}
+        if len(self.sim_q) > 0:
+            for i, q in enumerate(np.asarray(self.sim_q, dtype=float).tolist()):
+                if i < len(self.sim_joint_names):
+                    name = str(self.sim_joint_names[i])
+                else:
+                    name = f"joint_{i + 1}"
+                joints[name] = float(q)
+
+        result = {
+            "ok": True,
+            "backend": f"main-thread-{self._sim_backend}",
+            "simulation_ready": bool(self._sim_ready),
+            "joints_rad": joints,
+            "ee_xyz_m": [float(v) for v in np.asarray(xyz, dtype=float).tolist()],
+            "ee_rpy_rad": [float(v) for v in np.asarray(rpy, dtype=float).tolist()],
+        }
+        return True, result
+
+    def _tool_get_camera_frame_main_thread(self, payload: Dict[str, object]) -> Tuple[bool, Dict[str, object]]:
+        source = str(payload.get("source", "eye_in_hand") or "eye_in_hand").strip().lower()
+        width = max(160, min(1920, self._tool_to_int(payload.get("width", 960), 960)))
+        height = max(120, min(1080, self._tool_to_int(payload.get("height", 720), 720)))
+        fmt = str(payload.get("format", "jpg") or "jpg").strip().lower()
+        mode = str(payload.get("return_mode", "path") or "path").strip().lower()
+        if fmt not in ("jpg", "png"):
+            return False, {"ok": False, "error": "format must be 'jpg' or 'png'"}
+        if mode not in ("path", "base64"):
+            return False, {"ok": False, "error": "return_mode must be 'path' or 'base64'"}
+
+        frame = None
+        if source == "eye_in_hand" and self._using_virtual_vtk_camera():
+            try:
+                frame = self.sim_vtk_view.render_eye_in_hand_frame(width=width, height=height)
+            except Exception:
+                frame = None
+        if frame is None:
+            if self.last_frame is not None:
+                frame = self.last_frame.copy()
+                if frame.shape[1] != width or frame.shape[0] != height:
+                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return False, {"ok": False, "error": "no camera frame available"}
+
+        ext = ".jpg" if fmt == "jpg" else ".png"
+        ok_enc, encoded = cv2.imencode(ext, frame)
+        if not ok_enc:
+            return False, {"ok": False, "error": "failed to encode frame"}
+        blob = bytes(encoded.tobytes())
+
+        result: Dict[str, object] = {
+            "ok": True,
+            "backend": f"main-thread-{self._sim_backend}",
+            "source": source,
+            "width": int(frame.shape[1]),
+            "height": int(frame.shape[0]),
+            "format": fmt,
+            "timestamp": float(time.time()),
+        }
+        if mode == "path":
+            out_dir = Path("/tmp/mocearm_openclaw_frames")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"frame_{int(time.time() * 1000)}{ext}"
+            out_path.write_bytes(blob)
+            result["path"] = str(out_path.resolve())
+        else:
+            result["base64"] = base64.b64encode(blob).decode("ascii")
+        return True, result
+
+    def _tool_stop_robot_main_thread(self) -> Tuple[bool, Dict[str, object]]:
+        try:
+            self._on_quick_jog_released()
+        except Exception:
+            pass
+        return True, {"ok": True, "message": "stopped", "backend": f"main-thread-{self._sim_backend}"}
+
+    def _on_speech_tool_request(self, tool_name: str, payload: Dict[str, object], request_id: str):
+        speech = self.speech_window
+        req_id = str(request_id or "").strip()
+        if speech is None or not req_id:
+            return
+
+        name = str(tool_name or "").strip()
+        args = payload if isinstance(payload, dict) else {}
+        ok = False
+        result: Dict[str, object]
+
+        try:
+            if name == "move_robot_arm":
+                ok, result = self._tool_move_robot_arm_main_thread(args)
+            elif name == "get_robot_state":
+                ok, result = self._tool_get_robot_state_main_thread()
+            elif name == "get_camera_frame":
+                ok, result = self._tool_get_camera_frame_main_thread(args)
+            elif name == "stop_robot":
+                ok, result = self._tool_stop_robot_main_thread()
+            else:
+                ok = False
+                result = {"ok": False, "error": f"unsupported tool: {name}"}
+        except Exception as exc:
+            ok = False
+            result = {"ok": False, "error": str(exc)}
+
+        if hasattr(speech, "submit_tool_result"):
+            speech.submit_tool_result(req_id, bool(ok), result)
 
     def _is_speech_window_visible(self) -> bool:
         return self.speech_window is not None and self.speech_window.isVisible()
