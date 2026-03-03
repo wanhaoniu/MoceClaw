@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
 
 from hmi.camera_window import CameraWindow
 from hmi.pages import HomePage, JobPage, QuickMovePage, SettingsPage
+from hmi.speech_window import SpeechInputWindow
 from hmi.theme import apply_soft_effects, get_stylesheet
 from hmi.widgets import GlobalStatusBar
 from main import ArmClient, list_positions, list_recordings
@@ -72,9 +73,15 @@ except ImportError:
     VIDEO_AVAILABLE = False
 
 PICTURE_DIR = Path(__file__).resolve().parents[1] / "Picture"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 LOGO_PATH = PICTURE_DIR / "logo.png"
 MOCEAI_LIGHT_PATH = PICTURE_DIR / "moceai.png"
 MOCEAI_DARK_PATH = PICTURE_DIR / "moceai_Drak.jpg"
+SPEECH_ICON_PATHS = (
+    REPO_ROOT / "images" / "speech.png",
+    REPO_ROOT / "images" / "speech.pngg",
+    PICTURE_DIR / "speech.png",
+)
 
 HEADER_ICON_FILES = {
     "home": (
@@ -130,6 +137,7 @@ class ArmControlGUI(QMainWindow):
         self.video_client = None
         self.video_thread: Optional[VideoThread] = None
         self.camera_window: Optional[CameraWindow] = None
+        self.speech_window: Optional[SpeechInputWindow] = None
         self.connected = False
         self.connecting = False
         self.recording = False
@@ -191,9 +199,12 @@ class ArmControlGUI(QMainWindow):
                 "btn_back_home": "⌂",
                 "btn_camera": "📷 相机",
                 "btn_camera_close": "📷 关闭相机",
+                "btn_speech": "🎤 语音",
+                "btn_speech_close": "🎤 关闭语音",
                 "btn_log": "🧾 日志",
                 "lang_label": "语言",
                 "camera_window_title": "独立摄像头窗口",
+                "speech_window_title": "语音输入",
                 "status_ready": "就绪",
                 "status_connecting": "连接中...",
                 "status_connected": "已连接",
@@ -316,9 +327,12 @@ class ArmControlGUI(QMainWindow):
                 "btn_back_home": "⌂",
                 "btn_camera": "📷 Camera",
                 "btn_camera_close": "📷 Close Camera",
+                "btn_speech": "🎤 Voice",
+                "btn_speech_close": "🎤 Close Voice",
                 "btn_log": "🧾 Logs",
                 "lang_label": "Language",
                 "camera_window_title": "Camera Window",
+                "speech_window_title": "Voice Input",
                 "status_ready": "Ready",
                 "status_connecting": "Connecting...",
                 "status_connected": "Connected",
@@ -531,6 +545,11 @@ class ArmControlGUI(QMainWindow):
         self.camera_btn.clicked.connect(self.on_toggle_camera_window)
         layout.addWidget(self.camera_btn)
 
+        self.speech_btn = QPushButton(self._tr("btn_speech"))
+        self.speech_btn.setObjectName("primaryBtn")
+        self.speech_btn.clicked.connect(self.on_toggle_speech_window)
+        layout.addWidget(self.speech_btn)
+
         self.log_btn = QPushButton(self._tr("btn_log"))
         self.log_btn.setObjectName("primaryBtn")
         self.log_btn.setCheckable(True)
@@ -589,6 +608,7 @@ class ArmControlGUI(QMainWindow):
         self._back_home_has_icon = self._set_button_icon(self.back_home_btn, "home", size=18)
         self._top_settings_has_icon = self._set_button_icon(self.top_settings_btn, "settings", size=18)
         self.camera_btn.setIcon(QIcon())
+        self.speech_btn.setIcon(QIcon())
         self.log_btn.setIcon(QIcon())
 
     def _update_header_brand(self):
@@ -617,12 +637,16 @@ class ArmControlGUI(QMainWindow):
 
     def _plain_header_text(self, key: str) -> str:
         text = self._tr(key)
-        text = text.replace("📷 ", "").replace("🧾 ", "").replace("⌂", "").strip()
+        text = text.replace("📷 ", "").replace("🎤 ", "").replace("🧾 ", "").replace("⌂", "").strip()
         return text if text else self._tr(key)
 
     def _set_camera_btn_text(self, opened: bool):
         key = "btn_camera_close" if opened else "btn_camera"
         self.camera_btn.setText(self._plain_header_text(key))
+
+    def _set_speech_btn_text(self, opened: bool):
+        key = "btn_speech_close" if opened else "btn_speech"
+        self.speech_btn.setText(self._plain_header_text(key))
 
     def _make_log_text_widget(self):
         from PyQt5.QtWidgets import QTextEdit
@@ -739,6 +763,7 @@ class ArmControlGUI(QMainWindow):
             self.top_settings_btn.setText(self._tr("nav_settings"))
         self.top_settings_btn.setToolTip(self._tr("nav_settings"))
         self._set_camera_btn_text(self._is_camera_window_visible())
+        self._set_speech_btn_text(self._is_speech_window_visible())
         self.log_btn.setText(self._plain_header_text("btn_log"))
         self.lang_label.setText(self._tr("lang_label"))
 
@@ -752,6 +777,8 @@ class ArmControlGUI(QMainWindow):
 
         if self.camera_window is not None:
             self.camera_window.set_window_title(self._tr("camera_window_title"))
+        if self.speech_window is not None:
+            self.speech_window.set_window_title(self._tr("speech_window_title"))
 
         self._sync_language_combos()
         self._update_global_status_bar()
@@ -801,6 +828,8 @@ class ArmControlGUI(QMainWindow):
         if self.camera_window is not None:
             self.camera_window.setStyleSheet(stylesheet)
             apply_soft_effects(self.camera_window, theme_norm)
+        if self.speech_window is not None:
+            self.speech_window.set_theme(theme_norm)
         self._sync_theme_combo()
 
         if theme_norm == "dark" and self.settings_page.background_theme_combo.currentData() != "dark":
@@ -1260,6 +1289,46 @@ class ArmControlGUI(QMainWindow):
                 f"RTT: {self.last_rtt_text}",
                 self.recording,
             )
+
+    # ==================== Speech window ====================
+
+    def _resolve_speech_icon_path(self) -> Optional[Path]:
+        for path in SPEECH_ICON_PATHS:
+            if path.exists():
+                return path
+        return None
+
+    def _ensure_speech_window(self):
+        if self.speech_window is None:
+            self.speech_window = SpeechInputWindow(
+                self._tr("speech_window_title"),
+                self._resolve_speech_icon_path(),
+            )
+            self.speech_window.set_theme(self.current_theme)
+            self.speech_window.closed.connect(self._on_speech_window_closed)
+        return self.speech_window
+
+    def _on_speech_window_closed(self):
+        self._set_speech_btn_text(False)
+
+    def _is_speech_window_visible(self) -> bool:
+        return self.speech_window is not None and self.speech_window.isVisible()
+
+    def on_toggle_speech_window(self):
+        speech = self._ensure_speech_window()
+        if speech.isVisible():
+            speech.close()
+            self._set_speech_btn_text(False)
+            return
+
+        main_geo = self.frameGeometry()
+        pos_x = max(0, main_geo.right() - speech.width() - 24)
+        pos_y = max(0, main_geo.top() + 88)
+        speech.move(pos_x, pos_y)
+        speech.show()
+        speech.raise_()
+        speech.activateWindow()
+        self._set_speech_btn_text(True)
 
     # ==================== Logging ====================
 
@@ -2220,6 +2289,8 @@ class ArmControlGUI(QMainWindow):
 
         if self.camera_window is not None:
             self.camera_window.close()
+        if self.speech_window is not None:
+            self.speech_window.close()
 
         self._cleanup_sim_backend()
         event.accept()
