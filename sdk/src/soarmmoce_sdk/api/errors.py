@@ -28,3 +28,9 @@ class CapabilityError(SoarmMoceError):
     """Raised when a requested capability is unsupported by current transport/backend."""
 
     pass
+
+
+class PermissionError(SoarmMoceError):
+    """Raised when a control command is blocked by SDK permission policy."""
+
+    pass

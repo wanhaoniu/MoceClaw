@@ -51,3 +51,7 @@ class TransportBase:
         timeout: Optional[float] = None,
     ) -> None:
         raise NotImplementedError("set_gripper is not supported by this transport")
+
+    def get_gripper_open_ratio(self) -> Optional[float]:
+        """Return current gripper open ratio in [0, 1], if supported."""
+        return None

@@ -101,6 +101,20 @@ HEADER_ICON_FILES = {
 
 SIM_RENDER_SUPERSAMPLE = 1.4
 
+SDK_SRC = REPO_ROOT / "sdk" / "src"
+if SDK_SRC.exists() and str(SDK_SRC) not in sys.path:
+    sys.path.insert(0, str(SDK_SRC))
+
+try:
+    from soarmmoce_sdk import Robot
+
+    SDK_AVAILABLE = True
+    _SDK_IMPORT_ERROR = None
+except Exception as _sdk_e:
+    Robot = Any  # type: ignore[assignment]
+    SDK_AVAILABLE = False
+    _SDK_IMPORT_ERROR = _sdk_e
+
 
 class VideoThread(QThread):
     """Video polling thread."""
@@ -174,6 +188,10 @@ class ArmControlGUI(QMainWindow):
         self._sim_fk = None
         self._sim_matrix_to_rpy = None
         self._sim_solve_ik = None
+        self._sdk_robot: Optional[Robot] = None
+        self._sdk_lock = threading.RLock()
+        self._sdk_transport_override = str(os.getenv("SOARMMOCE_TRANSPORT", "")).strip().lower() or None
+        self._sdk_config_path = str(os.getenv("SOARMMOCE_CONFIG", "")).strip() or None
         self._jog_hold_timer = QTimer(self)
         self._jog_hold_timer.setInterval(100)
         self._jog_hold_timer.timeout.connect(self._on_quick_jog_hold_tick)
@@ -1440,6 +1458,82 @@ class ArmControlGUI(QMainWindow):
         except Exception:
             return int(default)
 
+    @staticmethod
+    def _tool_to_optional_float(value, default: Optional[float] = None) -> Optional[float]:
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _sdk_find_joint_index(joint_names: List[str], joint_name: str) -> Optional[int]:
+        key = str(joint_name or "").strip().lower()
+        if not key:
+            return None
+        for i, name in enumerate(joint_names):
+            if str(name).strip().lower() == key:
+                return i
+        for i, name in enumerate(joint_names):
+            if key in str(name).strip().lower():
+                return i
+        return None
+
+    def _sdk_transport_name(self, robot: Robot) -> str:
+        transport = getattr(robot, "_transport", None)
+        if transport is None:
+            return "uninitialized"
+        return type(transport).__name__
+
+    def _sdk_error_result(self, exc: Exception) -> Dict[str, object]:
+        msg = str(exc).strip() or exc.__class__.__name__
+        return {"ok": False, "error": msg, "error_type": exc.__class__.__name__, "backend": "sdk"}
+
+    def _sdk_get_robot(self) -> Robot:
+        if not SDK_AVAILABLE:
+            raise RuntimeError(f"soarmmoce_sdk import failed: {_SDK_IMPORT_ERROR}")
+
+        with self._sdk_lock:
+            if self._sdk_robot is None:
+                robot = Robot.from_config(self._sdk_config_path) if self._sdk_config_path else Robot()
+                if self._sdk_transport_override in ("mock", "tcp", "serial"):
+                    robot.config.setdefault("transport", {})["type"] = str(self._sdk_transport_override)
+                self._sdk_robot = robot
+
+            if not self._sdk_robot.connected:
+                self._sdk_robot.connect()
+
+            return self._sdk_robot
+
+    def _sdk_disconnect_robot(self):
+        with self._sdk_lock:
+            if self._sdk_robot is None:
+                return
+            try:
+                self._sdk_robot.disconnect()
+            except Exception:
+                pass
+
+    def _sync_sim_from_sdk_state(self, state: object):
+        if not self._sim_ready:
+            return
+        try:
+            q_src = np.asarray(getattr(getattr(state, "joint_state"), "q"), dtype=float).reshape(-1)
+        except Exception:
+            return
+        if q_src.shape[0] == 0 or len(self.sim_q) == 0:
+            return
+
+        q_dst = np.asarray(self.sim_q, dtype=float).copy()
+        n = min(q_dst.shape[0], q_src.shape[0])
+        q_dst[:n] = q_src[:n]
+        for i in range(min(n, len(self._sim_limits))):
+            lo, hi = self._sim_limits[i]
+            q_dst[i] = float(np.clip(q_dst[i], float(lo), float(hi)))
+        self.sim_q = q_dst
+        self._update_sim_plot()
+
     def _tool_find_joint_index(self, joint_name: str) -> Optional[int]:
         key = str(joint_name or "").strip().lower()
         if not key:
@@ -1487,90 +1581,108 @@ class ArmControlGUI(QMainWindow):
         return {"score": score, "red_ratio": float(red_ratio), "area_ratio": float(area_ratio)}
 
     def _tool_move_robot_arm_main_thread(self, payload: Dict[str, object]) -> Tuple[bool, Dict[str, object]]:
-        if not self._sim_ready:
-            return False, {"ok": False, "error": "simulation is not ready"}
-
-        pose = self._get_sim_pose_xyzrpy()
-        if pose is None:
-            return False, {"ok": False, "error": "failed to read current pose"}
-        xyz_now, rpy_now = pose
-
-        x = self._tool_to_float(payload.get("x", 0.0), float(xyz_now[0]))
-        y = self._tool_to_float(payload.get("y", 0.0), float(xyz_now[1]))
-        z = self._tool_to_float(payload.get("z", 0.0), float(xyz_now[2]))
+        x = self._tool_to_float(payload.get("x", 0.0), 0.0)
+        y = self._tool_to_float(payload.get("y", 0.0), 0.0)
+        z = self._tool_to_float(payload.get("z", 0.0), 0.0)
         frame = str(payload.get("frame", "base") or "base").strip().lower()
         duration = max(0.2, min(20.0, self._tool_to_float(payload.get("duration", 2.0), 2.0)))
         wait = bool(payload.get("wait", True))
+        timeout = self._tool_to_optional_float(payload.get("timeout"), None)
+        if timeout is not None and timeout < 0.0:
+            return False, {"ok": False, "error": "timeout must be >= 0"}
 
         if frame not in ("base", "tool"):
             return False, {"ok": False, "error": "frame must be 'base' or 'tool'"}
 
-        target_xyz = np.array([x, y, z], dtype=float)
+        try:
+            robot = self._sdk_get_robot()
+            state_before = robot.get_state()
+            q_solution = robot.move_tcp(
+                x=float(x),
+                y=float(y),
+                z=float(z),
+                rpy=None,
+                frame=frame,
+                duration=float(duration),
+                wait=bool(wait),
+                timeout=timeout,
+            )
+            state_after = robot.get_state()
+            self._sync_sim_from_sdk_state(state_after)
+        except Exception as exc:
+            result = self._sdk_error_result(exc)
+            return False, result
+
         if frame == "tool":
-            # Tool frame mode treats input xyz as local offset in meters.
-            R_now = self._rpy_to_rotmat(np.asarray(rpy_now, dtype=float))
-            target_xyz = np.asarray(xyz_now, dtype=float) + (R_now @ target_xyz)
+            base_xyz = np.asarray(state_before.tcp_pose.xyz, dtype=float)
+            base_rpy = np.asarray(state_before.tcp_pose.rpy, dtype=float)
+            target_xyz = base_xyz + (self._rpy_to_rotmat(base_rpy) @ np.asarray([x, y, z], dtype=float))
+        else:
+            target_xyz = np.asarray([x, y, z], dtype=float)
 
-        target_rpy = np.asarray(rpy_now, dtype=float)
-        q_target = self._solve_sim_ik(np.asarray(target_xyz, dtype=float), target_rpy)
-        if q_target is None:
-            return False, {"ok": False, "error": "IK failed for target", "target_xyz_m": target_xyz.tolist()}
-        if q_target.shape[0] != len(self.sim_q):
-            return False, {"ok": False, "error": "joint vector size mismatch"}
-
-        q_clipped = np.asarray(q_target, dtype=float).copy()
-        for i, (lo, hi) in enumerate(self._sim_limits):
-            q_clipped[i] = float(np.clip(q_clipped[i], float(lo), float(hi)))
-        self.sim_q = q_clipped
-        self._update_sim_plot()
-
-        pose_after = self._get_sim_pose_xyzrpy()
-        if pose_after is None:
-            return False, {"ok": False, "error": "failed to read pose after move"}
-        xyz_after, rpy_after = pose_after
-        err = float(np.linalg.norm(np.asarray(xyz_after, dtype=float) - np.asarray(target_xyz, dtype=float)))
+        xyz_after = np.asarray(state_after.tcp_pose.xyz, dtype=float)
+        rpy_after = np.asarray(state_after.tcp_pose.rpy, dtype=float)
+        err = float(np.linalg.norm(xyz_after - target_xyz))
         tol_m = 0.10
         within_tol = bool(err <= tol_m)
-
+        backend = f"sdk-{self._sdk_transport_name(robot)}"
         result = {
             "ok": within_tol,
             "message": "moved" if within_tol else "move completed with large error",
-            "backend": f"main-thread-{self._sim_backend}",
+            "backend": backend,
             "frame": frame,
-            "duration": duration,
-            "wait": wait,
+            "duration": float(duration),
+            "wait": bool(wait),
+            "timeout": timeout,
             "tolerance_m": tol_m,
             "within_tolerance": within_tol,
             "target_xyz_m": [float(v) for v in target_xyz.tolist()],
-            "actual_xyz_m": [float(v) for v in np.asarray(xyz_after, dtype=float).tolist()],
-            "actual_rpy_rad": [float(v) for v in np.asarray(rpy_after, dtype=float).tolist()],
+            "actual_xyz_m": [float(v) for v in xyz_after.tolist()],
+            "actual_rpy_rad": [float(v) for v in rpy_after.tolist()],
             "position_error_m": err,
-            "joint_values_rad": [float(v) for v in np.asarray(self.sim_q, dtype=float).tolist()],
+            "joint_values_rad": [float(v) for v in np.asarray(state_after.joint_state.q, dtype=float).tolist()],
+            "joint_solution_rad": [float(v) for v in np.asarray(q_solution, dtype=float).tolist()],
         }
         return bool(result["ok"]), result
 
     def _tool_get_robot_state_main_thread(self) -> Tuple[bool, Dict[str, object]]:
-        pose = self._get_sim_pose_xyzrpy()
-        if pose is None:
-            return False, {"ok": False, "error": "failed to read robot pose"}
-        xyz, rpy = pose
+        try:
+            robot = self._sdk_get_robot()
+            state = robot.get_state()
+            self._sync_sim_from_sdk_state(state)
+        except Exception as exc:
+            result = self._sdk_error_result(exc)
+            return False, result
 
+        names = list(getattr(robot.robot_model, "joint_names", []) or [])
         joints: Dict[str, float] = {}
-        if len(self.sim_q) > 0:
-            for i, q in enumerate(np.asarray(self.sim_q, dtype=float).tolist()):
-                if i < len(self.sim_joint_names):
-                    name = str(self.sim_joint_names[i])
-                else:
-                    name = f"joint_{i + 1}"
-                joints[name] = float(q)
+        q = np.asarray(state.joint_state.q, dtype=float).reshape(-1)
+        for i, value in enumerate(q.tolist()):
+            name = str(names[i]) if i < len(names) else f"joint_{i + 1}"
+            joints[name] = float(value)
 
+        gripper_state = state.gripper_state
+        permissions = state.permissions
         result = {
             "ok": True,
-            "backend": f"main-thread-{self._sim_backend}",
+            "backend": f"sdk-{self._sdk_transport_name(robot)}",
             "simulation_ready": bool(self._sim_ready),
+            "connected": bool(state.connected),
+            "timestamp": float(state.timestamp) if state.timestamp is not None else None,
             "joints_rad": joints,
-            "ee_xyz_m": [float(v) for v in np.asarray(xyz, dtype=float).tolist()],
-            "ee_rpy_rad": [float(v) for v in np.asarray(rpy, dtype=float).tolist()],
+            "ee_xyz_m": [float(v) for v in np.asarray(state.tcp_pose.xyz, dtype=float).tolist()],
+            "ee_rpy_rad": [float(v) for v in np.asarray(state.tcp_pose.rpy, dtype=float).tolist()],
+            "gripper": {
+                "available": bool(getattr(gripper_state, "available", False)),
+                "open_ratio": getattr(gripper_state, "open_ratio", None),
+                "moving": getattr(gripper_state, "moving", None),
+            },
+            "permissions": {
+                "allow_motion": bool(getattr(permissions, "allow_motion", True)),
+                "allow_gripper": bool(getattr(permissions, "allow_gripper", True)),
+                "allow_home": bool(getattr(permissions, "allow_home", True)),
+                "allow_stop": bool(getattr(permissions, "allow_stop", True)),
+            },
         }
         return True, result
 
@@ -1629,102 +1741,151 @@ class ArmControlGUI(QMainWindow):
             self._on_quick_jog_released()
         except Exception:
             pass
-        return True, {"ok": True, "message": "stopped", "backend": f"main-thread-{self._sim_backend}"}
+        try:
+            robot = self._sdk_get_robot()
+            robot.stop()
+            backend = f"sdk-{self._sdk_transport_name(robot)}"
+            return True, {"ok": True, "message": "stopped", "backend": backend}
+        except Exception as exc:
+            result = self._sdk_error_result(exc)
+            return False, result
 
     def _tool_set_gripper_main_thread(self, target: float) -> bool:
-        if len(self.sim_q) == 0 or len(self._sim_limits) != len(self.sim_q):
-            return False
         idx = self._tool_find_joint_index("gripper")
-        if idx is None:
+        if idx is None or idx >= len(self._sim_limits):
             return False
         lo, hi = self._sim_limits[idx]
-        q_new = np.asarray(self.sim_q, dtype=float).copy()
-        q_new[idx] = float(np.clip(float(target), float(lo), float(hi)))
-        self.sim_q = q_new
-        self._update_sim_plot()
-        return True
+        span = float(hi) - float(lo)
+        if abs(span) < 1e-8:
+            return False
+        ratio = float(np.clip((float(target) - float(lo)) / span, 0.0, 1.0))
+        ok, _ = self._tool_set_gripper_tool_main_thread({"open_ratio": ratio, "wait": True})
+        return bool(ok)
 
     def _tool_set_gripper_tool_main_thread(self, payload: Dict[str, object]) -> Tuple[bool, Dict[str, object]]:
-        if len(self.sim_q) == 0 or len(self._sim_limits) != len(self.sim_q):
-            return False, {"ok": False, "error": "simulation joint state unavailable"}
-        idx = self._tool_find_joint_index("gripper")
-        if idx is None:
-            return False, {"ok": False, "error": "gripper joint not found"}
-
-        lo, hi = self._sim_limits[idx]
         ratio = max(0.0, min(1.0, self._tool_to_float(payload.get("open_ratio", 1.0), 1.0)))
         wait = bool(payload.get("wait", True))
-        q_target = float(lo) + (float(hi) - float(lo)) * float(ratio)
-        ok = self._tool_set_gripper_main_thread(q_target)
-        q_now = float(np.asarray(self.sim_q, dtype=float)[idx]) if len(self.sim_q) > idx else float(q_target)
-        span = float(hi) - float(lo)
-        ratio_now = 0.0 if abs(span) < 1e-8 else float(np.clip((q_now - float(lo)) / span, 0.0, 1.0))
+        timeout = self._tool_to_optional_float(payload.get("timeout"), None)
+        if timeout is not None and timeout < 0.0:
+            return False, {"ok": False, "error": "timeout must be >= 0"}
+
+        try:
+            robot = self._sdk_get_robot()
+            robot.set_gripper(open_ratio=float(ratio), wait=bool(wait), timeout=timeout)
+            state = robot.get_state()
+            self._sync_sim_from_sdk_state(state)
+            backend = f"sdk-{self._sdk_transport_name(robot)}"
+        except Exception as exc:
+            result = self._sdk_error_result(exc)
+            return False, result
+
+        g = state.gripper_state
+        ratio_now = getattr(g, "open_ratio", None)
+        idx = self._tool_find_joint_index("gripper")
+        q_now = float(np.asarray(self.sim_q, dtype=float)[idx]) if idx is not None and len(self.sim_q) > idx else None
+        joint_name = str(self.sim_joint_names[idx]) if idx is not None and idx < len(self.sim_joint_names) else "gripper"
         result = {
-            "ok": bool(ok),
-            "message": "gripper moved" if ok else "gripper move failed",
-            "backend": f"main-thread-{self._sim_backend}",
-            "joint_name": str(self.sim_joint_names[idx]),
-            "wait": wait,
+            "ok": True,
+            "message": "gripper command completed",
+            "backend": backend,
+            "joint_name": joint_name,
+            "wait": bool(wait),
+            "timeout": timeout,
             "open_ratio_target": float(ratio),
-            "open_ratio_actual": float(ratio_now),
-            "joint_position_rad": float(q_now),
-            "joint_limits_rad": [float(lo), float(hi)],
+            "open_ratio_actual": float(ratio_now) if ratio_now is not None else None,
+            "joint_position_rad": q_now,
+            "gripper_available": bool(getattr(g, "available", False)),
         }
-        return bool(ok), result
+        return True, result
 
     def _tool_rotate_joint_main_thread(self, payload: Dict[str, object]) -> Tuple[bool, Dict[str, object]]:
-        if len(self.sim_q) == 0 or len(self._sim_limits) != len(self.sim_q):
-            return False, {"ok": False, "error": "simulation joint state unavailable"}
         joint_name = str(payload.get("joint_name", "") or "").strip()
         if not joint_name:
             return False, {"ok": False, "error": "joint_name is required"}
-        idx = self._tool_find_joint_index(joint_name)
-        if idx is None:
-            return False, {"ok": False, "error": f"joint not found: {joint_name}"}
 
-        lo, hi = self._sim_limits[idx]
-        q_now = float(np.asarray(self.sim_q, dtype=float)[idx])
         has_target = "target_deg" in payload and payload.get("target_deg") is not None
-        if has_target:
-            target_deg = self._tool_to_float(payload.get("target_deg", 0.0), math.degrees(q_now))
-            q_target = math.radians(target_deg)
-            delta_deg = math.degrees(q_target - q_now)
-        else:
-            delta_deg = self._tool_to_float(payload.get("delta_deg", 0.0), 0.0)
-            q_target = q_now + math.radians(delta_deg)
-            target_deg = math.degrees(q_target)
-        q_clipped = float(np.clip(q_target, float(lo), float(hi)))
+        delta_deg = self._tool_to_float(payload.get("delta_deg", 0.0), 0.0)
+        target_deg = self._tool_to_optional_float(payload.get("target_deg"), None)
+        wait = bool(payload.get("wait", True))
+        timeout = self._tool_to_optional_float(payload.get("timeout"), None)
+        duration = max(0.2, min(20.0, self._tool_to_float(payload.get("duration", 1.0), 1.0)))
+        if timeout is not None and timeout < 0.0:
+            return False, {"ok": False, "error": "timeout must be >= 0"}
 
-        q_new = np.asarray(self.sim_q, dtype=float).copy()
-        q_new[idx] = q_clipped
-        self.sim_q = q_new
-        self._update_sim_plot()
+        try:
+            robot = self._sdk_get_robot()
+            state_before = robot.get_state()
+            joint_names = list(getattr(robot.robot_model, "joint_names", []) or [])
+            idx = self._sdk_find_joint_index(joint_names, joint_name)
+            if idx is None:
+                return False, {"ok": False, "error": f"joint not found: {joint_name}"}
+            q_before = float(np.asarray(state_before.joint_state.q, dtype=float)[idx])
+            lo, hi = robot.robot_model.joint_limits[idx]
+
+            if has_target:
+                requested_target_deg = float(target_deg if target_deg is not None else math.degrees(q_before))
+                requested_delta_deg = float(requested_target_deg - math.degrees(q_before))
+                q_new = robot.rotate_joint(
+                    joint=joint_names[idx],
+                    target_deg=requested_target_deg,
+                    duration=duration,
+                    wait=wait,
+                    timeout=timeout,
+                )
+            else:
+                requested_delta_deg = float(delta_deg)
+                requested_target_deg = float(math.degrees(q_before) + requested_delta_deg)
+                q_new = robot.rotate_joint(
+                    joint=joint_names[idx],
+                    delta_deg=requested_delta_deg,
+                    duration=duration,
+                    wait=wait,
+                    timeout=timeout,
+                )
+
+            state_after = robot.get_state()
+            self._sync_sim_from_sdk_state(state_after)
+        except Exception as exc:
+            result = self._sdk_error_result(exc)
+            return False, result
+
+        q_after = float(np.asarray(q_new, dtype=float)[idx])
+        actual_target_deg = float(math.degrees(q_after))
+        clipped = bool(abs(actual_target_deg - requested_target_deg) > 1e-8)
+        backend = f"sdk-{self._sdk_transport_name(robot)}"
 
         result = {
             "ok": True,
             "message": "joint rotated",
-            "backend": f"main-thread-{self._sim_backend}",
-            "joint_name": str(self.sim_joint_names[idx]),
-            "wait": bool(payload.get("wait", True)),
-            "requested_delta_deg": float(delta_deg),
-            "requested_target_deg": float(target_deg),
-            "actual_target_deg": float(math.degrees(q_clipped)),
-            "clipped": bool(abs(q_clipped - q_target) > 1e-8),
+            "backend": backend,
+            "joint_name": str(joint_names[idx]),
+            "wait": bool(wait),
+            "timeout": timeout,
+            "requested_delta_deg": float(requested_delta_deg),
+            "requested_target_deg": float(requested_target_deg),
+            "actual_target_deg": float(actual_target_deg),
+            "clipped": clipped,
             "joint_limits_deg": [float(math.degrees(lo)), float(math.degrees(hi))],
         }
         return True, result
 
     def _tool_scan_for_object_main_thread(self, payload: Dict[str, object]) -> Tuple[bool, Dict[str, object]]:
-        if len(self.sim_q) == 0 or len(self._sim_limits) != len(self.sim_q):
-            return False, {"ok": False, "error": "simulation joint state unavailable"}
         object_name = str(payload.get("object_name", "") or "").strip()
         if not object_name:
             return False, {"ok": False, "error": "object_name is required"}
 
         joint_name = str(payload.get("joint_name", "wrist_roll") or "wrist_roll").strip()
-        idx = self._tool_find_joint_index(joint_name)
+        try:
+            robot = self._sdk_get_robot()
+            state0 = robot.get_state()
+        except Exception as exc:
+            result = self._sdk_error_result(exc)
+            return False, result
+
+        joint_names = list(getattr(robot.robot_model, "joint_names", []) or [])
+        idx = self._sdk_find_joint_index(joint_names, joint_name)
         if idx is None:
-            idx = self._tool_find_joint_index("wrist_roll")
+            idx = self._sdk_find_joint_index(joint_names, "wrist_roll")
         if idx is None:
             return False, {"ok": False, "error": "scan joint not found (expected wrist_roll)"}
 
@@ -1737,7 +1898,7 @@ class ArmControlGUI(QMainWindow):
         step_deg = max(2.0, min(60.0, self._tool_to_float(payload.get("step_deg", 15.0), 15.0)))
         return_to_start = bool(payload.get("return_to_start", False))
 
-        q_start = float(np.asarray(self.sim_q, dtype=float)[idx])
+        q_start = float(np.asarray(state0.joint_state.q, dtype=float)[idx])
         start_deg = float(math.degrees(q_start))
         half = sweep_range_deg / 2.0
         n_pts = int(max(3, min(25, round(sweep_range_deg / step_deg) + 1)))
@@ -1753,7 +1914,7 @@ class ArmControlGUI(QMainWindow):
         for off in offsets:
             target_deg = float(start_deg + float(off))
             ok_rot, rot_result = self._tool_rotate_joint_main_thread(
-                {"joint_name": str(self.sim_joint_names[idx]), "target_deg": target_deg, "wait": True}
+                {"joint_name": str(joint_names[idx]), "target_deg": target_deg, "wait": True}
             )
             if not ok_rot:
                 samples.append({"angle_deg": target_deg, "ok": False, "score": 0.0})
@@ -1790,20 +1951,20 @@ class ArmControlGUI(QMainWindow):
         found = bool(best_score >= 0.12 and red_target)
         if return_to_start:
             self._tool_rotate_joint_main_thread(
-                {"joint_name": str(self.sim_joint_names[idx]), "target_deg": start_deg, "wait": True}
+                {"joint_name": str(joint_names[idx]), "target_deg": start_deg, "wait": True}
             )
         elif found:
             self._tool_rotate_joint_main_thread(
-                {"joint_name": str(self.sim_joint_names[idx]), "target_deg": best_angle_deg, "wait": True}
+                {"joint_name": str(joint_names[idx]), "target_deg": best_angle_deg, "wait": True}
             )
 
         result = {
             "ok": True,
-            "backend": f"main-thread-{self._sim_backend}",
+            "backend": f"sdk-{self._sdk_transport_name(robot)}",
             "message": "scan completed",
             "object_name": object_name,
             "detector": "red_hsv" if red_target else "unsupported_object_name",
-            "scan_joint": str(self.sim_joint_names[idx]),
+            "scan_joint": str(joint_names[idx]),
             "source": source,
             "found": found,
             "confidence": float(max(0.0, best_score)),
@@ -1828,10 +1989,15 @@ class ArmControlGUI(QMainWindow):
             return False, {"ok": False, "error": "run_skill requires non-empty name"}
 
         if raw_name in ("dance_short", "dance", "wave"):
-            pose = self._get_sim_pose_xyzrpy()
-            if pose is None:
-                return False, {"ok": False, "error": "failed to read current pose"}
-            xyz0, _rpy0 = pose
+            try:
+                robot = self._sdk_get_robot()
+                state0 = robot.get_state()
+                self._sync_sim_from_sdk_state(state0)
+            except Exception as exc:
+                result = self._sdk_error_result(exc)
+                return False, result
+
+            xyz0 = np.asarray(state0.tcp_pose.xyz, dtype=float)
             amp_xy = max(0.01, min(0.10, self._tool_to_float(params.get("amplitude_xy", 0.04), 0.04)))
             amp_z = max(0.00, min(0.10, self._tool_to_float(params.get("amplitude_z", 0.02), 0.02)))
             duration = max(0.2, min(3.0, self._tool_to_float(params.get("duration", 0.6), 0.6)))
@@ -1858,7 +2024,7 @@ class ArmControlGUI(QMainWindow):
                     "skill": "dance_short",
                     "message": "dance skill completed",
                     "steps": step_results,
-                    "backend": f"main-thread-{self._sim_backend}",
+                    "backend": f"sdk-{self._sdk_transport_name(robot)}",
                 },
             )
 
@@ -1909,7 +2075,7 @@ class ArmControlGUI(QMainWindow):
                     "skill": "grasp_apple_mock",
                     "message": "grasp apple mock completed",
                     "target_xyz_m": [float(target_x), float(target_y), float(target_z)],
-                    "backend": f"main-thread-{self._sim_backend}",
+                    "backend": "sdk",
                     "phases": phases,
                 },
             )
@@ -2092,6 +2258,8 @@ class ArmControlGUI(QMainWindow):
             except Exception:
                 pass
             self.client = None
+
+        self._sdk_disconnect_robot()
 
         self.connected = False
         self.connecting = False
@@ -2397,17 +2565,10 @@ class ArmControlGUI(QMainWindow):
     def _select_sim_urdf_path(self) -> Optional[Path]:
         repo_root = Path(__file__).resolve().parents[3]
         candidates = [
-            repo_root / "sdk" / "src" / "soarmMoce_sdk" / "resources" / "urdf" / "soarmoce_urdf.urdf",
-            repo_root / "Urdf" / "urdf" / "soarmoce_purple.urdf",
-            repo_root / "Urdf" / "urdf" / "soarmoce_urdf.urdf",
-            repo_root / "Soarm101" / "SO101" / "so101_new_calib.urdf",
-            Path(__file__).resolve().parents[1] / "so101.urdf",
+            repo_root / "sdk" / "src" / "soarmmoce_sdk" / "resources" / "urdf" / "soarmoce_urdf.urdf",
         ]
         for path in candidates:
             if path.exists():
-                # so101.urdf requires a sibling assets directory, otherwise PyBullet load fails.
-                if path.name == "so101.urdf" and not (path.parent / "assets").exists():
-                    continue
                 return path
         return None
 
@@ -2928,6 +3089,7 @@ class ArmControlGUI(QMainWindow):
         if self.speech_window is not None:
             self.speech_window.close()
 
+        self._sdk_disconnect_robot()
         self._cleanup_sim_backend()
         event.accept()
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from soarmmoce_sdk import CapabilityError, Robot, TimeoutError
+from soarmmoce_sdk import CapabilityError, PermissionError, Robot, TimeoutError
 
 
 def test_get_state_default_config():
@@ -14,6 +14,11 @@ def test_get_state_default_config():
     assert state.joint_state.q.shape[0] == robot.robot_model.dof
     assert state.tcp_pose.xyz.shape == (3,)
     assert state.tcp_pose.rpy.shape == (3,)
+    assert state.gripper_state is not None
+    assert state.gripper_state.available is True
+    assert state.gripper_state.open_ratio == pytest.approx(1.0)
+    assert state.permissions is not None
+    assert state.permissions.allow_motion is True
     assert isinstance(state.timestamp, float)
 
     robot.disconnect()
@@ -88,5 +93,31 @@ def test_wait_timeout_best_effort():
     q = robot.get_joint_state().q
     with pytest.raises(TimeoutError):
         robot.move_joints(q, duration=0.1, wait=True, timeout=0.01)
+
+    robot.disconnect()
+
+
+def test_permission_blocks_motion():
+    robot = Robot()
+    robot.connect()
+    robot.set_permissions(allow_motion=False)
+    q = robot.get_joint_state().q
+
+    with pytest.raises(PermissionError):
+        robot.move_joints(q, duration=0.01)
+
+    robot.disconnect()
+
+
+def test_rotate_joint_changes_one_joint():
+    robot = Robot()
+    robot.connect()
+
+    q0 = robot.get_joint_state().q.copy()
+    q1 = robot.rotate_joint("wrist_roll", delta_deg=5.0, duration=0.01, wait=True, timeout=0.1)
+    idx = robot.robot_model.joint_names.index("wrist_roll")
+
+    assert q1.shape == q0.shape
+    assert q1[idx] != pytest.approx(q0[idx])
 
     robot.disconnect()

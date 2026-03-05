@@ -20,7 +20,8 @@ import sounddevice as sd
 from PyQt5.QtCore import QPoint, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QWidget
-
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file, if it exists
 try:
     from .skills_dispatcher import LocalToolDispatcher, OPENAI_TOOL_SCHEMAS, ensure_tools_schema_file
 except Exception:
@@ -28,7 +29,7 @@ except Exception:
 
 # Extracted for easy replacement with env var later.
 # Recommended: export GROQ_API_KEY and remove fallback literal.
-GROQ_API_KEY_FALLBACK = ""
+GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL_DEFAULT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL_DEFAULT = "whisper-large-v3"
 

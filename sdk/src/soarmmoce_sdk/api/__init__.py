@@ -1,11 +1,22 @@
 from .robot import Robot
-from .types import JointState, Pose, RobotState
-from .errors import CapabilityError, ConnectionError, IKError, LimitError, ProtocolError, SoarmMoceError, TimeoutError
+from .types import GripperState, JointState, PermissionState, Pose, RobotState
+from .errors import (
+    CapabilityError,
+    ConnectionError,
+    IKError,
+    LimitError,
+    PermissionError,
+    ProtocolError,
+    SoarmMoceError,
+    TimeoutError,
+)
 
 __all__ = [
     "Robot",
     "JointState",
     "Pose",
+    "GripperState",
+    "PermissionState",
     "RobotState",
     "SoarmMoceError",
     "ConnectionError",
@@ -14,4 +25,5 @@ __all__ = [
     "IKError",
     "LimitError",
     "CapabilityError",
+    "PermissionError",
 ]

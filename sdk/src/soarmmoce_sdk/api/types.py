@@ -20,8 +20,25 @@ class Pose:
 
 
 @dataclass
+class GripperState:
+    available: bool
+    open_ratio: Optional[float] = None
+    moving: Optional[bool] = None
+
+
+@dataclass
+class PermissionState:
+    allow_motion: bool = True
+    allow_gripper: bool = True
+    allow_home: bool = True
+    allow_stop: bool = True
+
+
+@dataclass
 class RobotState:
     connected: bool
     joint_state: JointState
     tcp_pose: Pose
+    gripper_state: Optional[GripperState] = None
+    permissions: Optional[PermissionState] = None
     timestamp: Optional[float] = None

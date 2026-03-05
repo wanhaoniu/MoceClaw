@@ -18,6 +18,12 @@ control:
   hz: 100
   timeout: 2.0
 
+permissions:
+  allow_motion: true
+  allow_gripper: true
+  allow_home: true
+  allow_stop: true
+
 protocol:
   unit: deg
   max_retries: 1

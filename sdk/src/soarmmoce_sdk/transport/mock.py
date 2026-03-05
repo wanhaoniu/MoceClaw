@@ -70,3 +70,8 @@ class MockTransport(TransportBase):
         self._motion_end_time = time.monotonic() + 0.05
         if wait:
             self.wait_until_stopped(timeout=timeout)
+
+    def get_gripper_open_ratio(self) -> Optional[float]:
+        if not self._connected:
+            raise RuntimeError("MockTransport not connected")
+        return float(self._gripper_open_ratio)

@@ -11,3 +11,5 @@ Software/Slave/recordings_local
 *.egg-info/
 sdk/build/
 sdk/dist/
+.env
+
