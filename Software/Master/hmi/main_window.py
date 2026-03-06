@@ -1403,12 +1403,8 @@ class ArmControlGUI(QMainWindow):
                 self.speech_window.agent_reply_ready.connect(self._on_speech_agent_reply_ready)
             if hasattr(self.speech_window, "agent_failed"):
                 self.speech_window.agent_failed.connect(self._on_speech_agent_failed)
-            if hasattr(self.speech_window, "agent_action_started"):
-                self.speech_window.agent_action_started.connect(self._on_speech_agent_action_started)
             if hasattr(self.speech_window, "agent_session_changed"):
                 self.speech_window.agent_session_changed.connect(self._on_speech_agent_session_changed)
-            if hasattr(self.speech_window, "tool_request"):
-                self.speech_window.tool_request.connect(self._on_speech_tool_request)
         return self.speech_window
 
     def _on_speech_window_closed(self):
@@ -1438,11 +1434,6 @@ class ArmControlGUI(QMainWindow):
         msg = str(message or "").strip() or "OpenClaw invocation failed"
         self.log(f"[OpenClaw] {msg}", "error")
         self.statusBar().showMessage(msg)
-
-    def _on_speech_agent_action_started(self, action_name: str):
-        action = str(action_name or "").strip() or "unknown"
-        self.log(f"[OpenClaw] 正在执行动作: {action}", "info")
-        self.statusBar().showMessage(f"正在执行动作: {action}...")
 
     def _on_speech_agent_session_changed(self, session_id: str):
         sid = str(session_id or "").strip()
@@ -2088,44 +2079,6 @@ class ArmControlGUI(QMainWindow):
             )
 
         return False, {"ok": False, "error": f"unsupported skill: {raw_name}"}
-
-    def _on_speech_tool_request(self, tool_name: str, payload: Dict[str, object], request_id: str):
-        speech = self.speech_window
-        req_id = str(request_id or "").strip()
-        if speech is None or not req_id:
-            return
-
-        name = str(tool_name or "").strip()
-        args = payload if isinstance(payload, dict) else {}
-        ok = False
-        result: Dict[str, object]
-
-        try:
-            if name == "move_robot_arm":
-                ok, result = self._tool_move_robot_arm_main_thread(args)
-            elif name == "get_robot_state":
-                ok, result = self._tool_get_robot_state_main_thread()
-            elif name == "get_camera_frame":
-                ok, result = self._tool_get_camera_frame_main_thread(args)
-            elif name == "stop_robot":
-                ok, result = self._tool_stop_robot_main_thread()
-            elif name == "set_gripper":
-                ok, result = self._tool_set_gripper_tool_main_thread(args)
-            elif name == "rotate_joint":
-                ok, result = self._tool_rotate_joint_main_thread(args)
-            elif name == "scan_for_object":
-                ok, result = self._tool_scan_for_object_main_thread(args)
-            elif name == "run_skill":
-                ok, result = self._tool_run_skill_main_thread(args)
-            else:
-                ok = False
-                result = {"ok": False, "error": f"unsupported tool: {name}"}
-        except Exception as exc:
-            ok = False
-            result = {"ok": False, "error": str(exc)}
-
-        if hasattr(speech, "submit_tool_result"):
-            speech.submit_tool_result(req_id, bool(ok), result)
 
     def _is_speech_window_visible(self) -> bool:
         return self.speech_window is not None and self.speech_window.isVisible()

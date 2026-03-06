@@ -5,10 +5,8 @@ from __future__ import annotations
 import io
 import json
 import os
-import queue
 import re
 import subprocess
-import threading
 import wave
 import time
 from pathlib import Path
@@ -22,10 +20,6 @@ from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QWidget
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file, if it exists
-try:
-    from .skills_dispatcher import LocalToolDispatcher, OPENAI_TOOL_SCHEMAS, ensure_tools_schema_file
-except Exception:
-    from skills_dispatcher import LocalToolDispatcher, OPENAI_TOOL_SCHEMAS, ensure_tools_schema_file
 
 # Extracted for easy replacement with env var later.
 # Recommended: export GROQ_API_KEY and remove fallback literal.
@@ -38,8 +32,6 @@ OPENCLAW_AGENT_ID_DEFAULT = "main"
 OPENCLAW_TIMEOUT_SEC_DEFAULT = 90.0
 
 OPENCLAW_THINKING_DEFAULT = "minimal"
-OPENCLAW_MAX_TOOL_TURNS_DEFAULT = 4
-OPENCLAW_TOOL_REQUEST_TIMEOUT_SEC_DEFAULT = 6.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -363,9 +355,6 @@ class _GroqSttWorker(QThread):
 class _OpenClawAgentWorker(QThread):
     done = pyqtSignal(str, str)
     failed = pyqtSignal(str)
-    action_started = pyqtSignal(str)
-    sig_tool_request = pyqtSignal(str, dict, str)  # tool_name, payload, request_id
-    sig_tool_result = pyqtSignal(str, bool, dict)  # request_id, ok, result
 
     def __init__(
         self,
@@ -376,9 +365,6 @@ class _OpenClawAgentWorker(QThread):
         local_mode: bool,
         timeout_sec: float,
         thinking: str,
-        max_tool_turns: int = OPENCLAW_MAX_TOOL_TURNS_DEFAULT,
-        tools_schema_path: Optional[str] = None,
-        tool_request_timeout_sec: float = OPENCLAW_TOOL_REQUEST_TIMEOUT_SEC_DEFAULT,
     ):
         super().__init__()
         self._message = str(message or "").strip()
@@ -388,83 +374,6 @@ class _OpenClawAgentWorker(QThread):
         self._local_mode = bool(local_mode)
         self._timeout_sec = max(5.0, float(timeout_sec))
         self._thinking = str(thinking or OPENCLAW_THINKING_DEFAULT).strip() or OPENCLAW_THINKING_DEFAULT
-        self._max_tool_turns = max(1, int(max_tool_turns))
-        self._tools_schema_path = str(tools_schema_path or "").strip()
-        self._tool_request_timeout_sec = max(2.0, float(tool_request_timeout_sec))
-        self._dispatcher = LocalToolDispatcher(
-            tool_requester=self._request_tool_on_main_thread,
-            tool_request_timeout_sec=self._tool_request_timeout_sec,
-        )
-        self._has_tools_arg_cache: Optional[bool] = None
-        self._pending_tool_results: Dict[str, queue.Queue] = {}
-        self._pending_tool_lock = threading.Lock()
-        self.sig_tool_result.connect(self._on_sig_tool_result)
-
-    def _request_tool_on_main_thread(
-        self,
-        tool_name: str,
-        payload: Dict[str, Any],
-        request_id: str,
-        timeout_sec: float,
-    ) -> Dict[str, Any]:
-        req_id = str(request_id or "").strip()
-        if not req_id:
-            req_id = f"req_{time.time_ns()}"
-        wait_timeout = max(0.5, float(timeout_sec))
-
-        q: queue.Queue = queue.Queue(maxsize=1)
-        with self._pending_tool_lock:
-            self._pending_tool_results[req_id] = q
-
-        try:
-            self.sig_tool_request.emit(str(tool_name or ""), dict(payload or {}), req_id)
-            try:
-                got_ok, got_result = q.get(timeout=wait_timeout)
-            except queue.Empty:
-                return {
-                    "ok": False,
-                    "result": {
-                        "ok": False,
-                        "error": f"tool result timeout ({wait_timeout:.1f}s)",
-                        "tool": str(tool_name or ""),
-                    },
-                }
-            result_payload = got_result if isinstance(got_result, dict) else {"value": got_result}
-            return {"ok": bool(got_ok), "result": result_payload}
-        finally:
-            with self._pending_tool_lock:
-                self._pending_tool_results.pop(req_id, None)
-
-    def _on_sig_tool_result(self, request_id: str, ok: bool, result: Dict[str, Any]):
-        req_id = str(request_id or "").strip()
-        if not req_id:
-            return
-        with self._pending_tool_lock:
-            q = self._pending_tool_results.get(req_id)
-        if q is None:
-            return
-        payload = result if isinstance(result, dict) else {"value": result}
-        try:
-            q.put_nowait((bool(ok), payload))
-        except Exception:
-            pass
-
-    def _supports_tools_arg(self) -> bool:
-        if self._has_tools_arg_cache is not None:
-            return bool(self._has_tools_arg_cache)
-        try:
-            proc = subprocess.run(
-                [self._openclaw_bin, "agent", "--help"],
-                capture_output=True,
-                text=True,
-                timeout=8.0,
-                check=False,
-            )
-            output = f"{proc.stdout}\n{proc.stderr}"
-            self._has_tools_arg_cache = "--tools" in output
-        except Exception:
-            self._has_tools_arg_cache = False
-        return bool(self._has_tools_arg_cache)
 
     def _build_agent_cmd(self, message: str, session_id: str) -> List[str]:
         cmd = [
@@ -484,10 +393,6 @@ class _OpenClawAgentWorker(QThread):
             cmd.extend(["--session-id", session_id])
         else:
             cmd.extend(["--agent", self._agent_id])
-
-        if self._supports_tools_arg():
-            schema_path = ensure_tools_schema_file(Path(self._tools_schema_path) if self._tools_schema_path else None)
-            cmd.extend(["--tools", str(schema_path)])
         return cmd
 
     def _invoke_openclaw_once(self, message: str, session_id: str) -> Dict[str, Any]:
@@ -524,114 +429,45 @@ class _OpenClawAgentWorker(QThread):
             "stderr": stderr_text,
         }
 
-    @staticmethod
-    def _make_tool_result_message(results: List[Dict[str, Any]]) -> str:
-        blob = json.dumps(results, ensure_ascii=False)
-        return (
-            "以下是你刚请求的工具执行结果（JSON）：\n"
-            f"{blob}\n\n"
-            "请基于这些结果继续，并严格遵守：\n"
-            "1) 必须优先依据每条 result 里的 ok / within_tolerance 字段判断执行是否成功。\n"
-            "2) 若 ok=true（或 within_tolerance=true），禁止描述为“误差较大”或“失败”。\n"
-            "3) 若 ok=false，才可以描述失败或误差超限。\n"
-            "4) 如果当前目标复杂（如抓取、跳舞），优先尝试 run_skill 或 scan_for_object + move_robot_arm + set_gripper，而不是直接拒绝。\n"
-            "5) 如果还需要工具调用，请继续返回 tool_calls；如果任务完成，请直接返回最终中文答复。"
-        )
-
-    @staticmethod
-    def _make_tool_instruction_prefix(user_message: str) -> str:
-        schema_blob = json.dumps(OPENAI_TOOL_SCHEMAS, ensure_ascii=False)
-        return (
-            "你正在控制 SO-ARM-MoceArm。本轮可用工具如下（OpenAI tools schema）：\n"
-            f"{schema_blob}\n\n"
-            "规则：\n"
-            "1) 当你需要执行动作时，请只返回 JSON，不要输出解释、思考过程或多余文本。\n"
-            "2) JSON 格式必须是："
-            "{\"tool_calls\":[{\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"...\",\"arguments\":\"{...}\"}}]}。\n"
-            "3) 当用户要求执行相对移动（如“高一点”“往左移动”）时，必须先调用 get_robot_state 获取当前 (x,y,z) 绝对坐标，"
-            "再把相对偏移量加到当前坐标上，最后调用 move_robot_arm。\n"
-            "4) 夹爪控制优先使用 set_gripper(open_ratio)。open_ratio=1 表示张开，0 表示闭合。\n"
-            "5) 旋转相机/腕部观察时，优先使用 rotate_joint(joint_name=\"wrist_roll\", delta_deg=...)。\n"
-            "6) 抓取类任务（如“抓红苹果”）优先顺序：scan_for_object -> move_robot_arm -> set_gripper；或直接 run_skill。\n"
-            "7) 遇到高层目标（如“抓红苹果”“让机械臂跳舞”）时，优先调用 run_skill：\n"
-            "   - 抓苹果 -> run_skill(name=\"grasp_apple_mock\", params={...})\n"
-            "   - 跳舞 -> run_skill(name=\"dance_short\", params={...})\n"
-            "   只有明确超出当前能力且存在安全风险时，才简短拒绝。\n"
-            "8) 对无效语音或闲聊（非控制指令）返回简短自然回复，不要生硬报错。\n\n"
-            f"用户请求：{user_message}"
-        )
-
     def run(self):
         if not self._message:
             self.failed.emit("OpenClaw 输入为空")
             return
 
-        current_session = self._session_id
-        if self._supports_tools_arg():
-            current_message = self._message
-        else:
-            current_message = self._make_tool_instruction_prefix(self._message)
-        tool_turn = 0
-
-        while True:
-            if self.isInterruptionRequested():
-                self.failed.emit("OpenClaw 请求已取消")
-                return
-
-            try:
-                result = self._invoke_openclaw_once(message=current_message, session_id=current_session)
-            except Exception as exc:
-                self.failed.emit(str(exc))
-                return
-
-            payload = result.get("payload")
-            stdout_text = str(result.get("stdout", "")).strip()
-            next_session = _extract_openclaw_session_id(payload)
-            if next_session:
-                current_session = next_session
-
-            tool_calls = _extract_tool_calls_from_payload(payload)
-            if tool_calls:
-                tool_turn += 1
-                if tool_turn > self._max_tool_turns:
-                    self.failed.emit("Tool 调用轮数超限，已中止")
-                    return
-
-                call_results: List[Dict[str, Any]] = []
-                for call in tool_calls:
-                    name = str(call.get("name", "")).strip()
-                    args = call.get("arguments", {})
-                    if not isinstance(args, dict):
-                        args = {}
-                    self.action_started.emit(name)
-                    try:
-                        tool_result = self._dispatcher.dispatch(name=name, arguments=args)
-                        ok = True
-                    except Exception as exc:
-                        tool_result = f"tool execution failed: {exc}"
-                        ok = False
-                    call_results.append(
-                        {
-                            "tool_call_id": str(call.get("id", "")).strip(),
-                            "name": name,
-                            "arguments": args,
-                            "ok": ok,
-                            "result": tool_result,
-                        }
-                    )
-
-                current_message = self._make_tool_result_message(call_results)
-                continue
-
-            reply = _extract_text_from_openclaw_payload(payload)
-            if not reply:
-                reply = stdout_text
-            reply = str(reply or "").strip()
-            if not reply:
-                self.failed.emit("OpenClaw 未返回可用文本")
-                return
-            self.done.emit(reply, current_session)
+        if self.isInterruptionRequested():
+            self.failed.emit("OpenClaw 请求已取消")
             return
+
+        try:
+            result = self._invoke_openclaw_once(message=self._message, session_id=self._session_id)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        payload = result.get("payload")
+        stdout_text = str(result.get("stdout", "")).strip()
+        current_session = _extract_openclaw_session_id(payload) or self._session_id
+
+        tool_calls = _extract_tool_calls_from_payload(payload)
+        if tool_calls:
+            names = [str(x.get("name", "")).strip() for x in tool_calls]
+            names = [x for x in names if x]
+            summary = ", ".join(names[:4]) if names else "unknown"
+            self.failed.emit(
+                "OpenClaw 返回了 tool_calls（"
+                f"{summary}），但当前 GUI 不再执行本地工具。"
+                "请确认 ~/.openclaw/skills 的技能已正确安装并可由 OpenClaw 原生执行。"
+            )
+            return
+
+        reply = _extract_text_from_openclaw_payload(payload)
+        if not reply:
+            reply = stdout_text
+        reply = str(reply or "").strip()
+        if not reply:
+            self.failed.emit("OpenClaw 未返回可用文本")
+            return
+        self.done.emit(reply, current_session)
 
 
 class SpeechInputWindow(QWidget):
@@ -644,9 +480,7 @@ class SpeechInputWindow(QWidget):
     transcript_failed = pyqtSignal(str)
     agent_reply_ready = pyqtSignal(str)
     agent_failed = pyqtSignal(str)
-    agent_action_started = pyqtSignal(str)
     agent_session_changed = pyqtSignal(str)
-    tool_request = pyqtSignal(str, dict, str)  # tool_name, payload, request_id
 
     def __init__(self, title: str, icon_path: Optional[Path] = None):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -699,26 +533,6 @@ class SpeechInputWindow(QWidget):
             self._openclaw_timeout_sec = OPENCLAW_TIMEOUT_SEC_DEFAULT
         self._openclaw_timeout_sec = max(5.0, self._openclaw_timeout_sec)
         self._openclaw_session_id = str(os.getenv("OPENCLAW_SESSION_ID", "")).strip()
-        try:
-            self._openclaw_max_tool_turns = int(
-                str(os.getenv("OPENCLAW_MAX_TOOL_TURNS", str(OPENCLAW_MAX_TOOL_TURNS_DEFAULT))).strip()
-            )
-        except Exception:
-            self._openclaw_max_tool_turns = OPENCLAW_MAX_TOOL_TURNS_DEFAULT
-        self._openclaw_max_tool_turns = max(1, self._openclaw_max_tool_turns)
-        self._openclaw_tools_schema_path = str(os.getenv("OPENCLAW_TOOLS_PATH", "")).strip()
-        try:
-            self._openclaw_tool_request_timeout_sec = float(
-                str(
-                    os.getenv(
-                        "OPENCLAW_TOOL_REQUEST_TIMEOUT_SEC",
-                        str(OPENCLAW_TOOL_REQUEST_TIMEOUT_SEC_DEFAULT),
-                    )
-                ).strip()
-            )
-        except Exception:
-            self._openclaw_tool_request_timeout_sec = OPENCLAW_TOOL_REQUEST_TIMEOUT_SEC_DEFAULT
-        self._openclaw_tool_request_timeout_sec = max(2.0, self._openclaw_tool_request_timeout_sec)
 
         if icon_path is not None:
             self.set_icon(icon_path)
@@ -756,9 +570,6 @@ class SpeechInputWindow(QWidget):
         thinking: Optional[str] = None,
         timeout_sec: Optional[float] = None,
         session_id: Optional[str] = None,
-        max_tool_turns: Optional[int] = None,
-        tools_schema_path: Optional[str] = None,
-        tool_request_timeout_sec: Optional[float] = None,
     ):
         self._openclaw_enabled = bool(enabled)
         if openclaw_bin is not None:
@@ -782,33 +593,10 @@ class SpeechInputWindow(QWidget):
                 pass
         if session_id is not None:
             self._openclaw_session_id = str(session_id).strip()
-        if max_tool_turns is not None:
-            try:
-                self._openclaw_max_tool_turns = max(1, int(max_tool_turns))
-            except Exception:
-                pass
-        if tools_schema_path is not None:
-            self._openclaw_tools_schema_path = str(tools_schema_path).strip()
-        if tool_request_timeout_sec is not None:
-            try:
-                self._openclaw_tool_request_timeout_sec = max(2.0, float(tool_request_timeout_sec))
-            except Exception:
-                pass
 
     # Backward compatibility for old call sites.
     def set_minimax_config(self, api_key: str, stt_url: Optional[str] = None, model: Optional[str] = None):
         self.set_groq_config(api_key=api_key, stt_url=stt_url, model=model)
-
-    @staticmethod
-    def get_openclaw_tool_schemas() -> List[Dict[str, Any]]:
-        return list(OPENAI_TOOL_SCHEMAS)
-
-    @staticmethod
-    def export_openclaw_tool_schemas(path: Optional[Path] = None) -> Path:
-        # Ensures schema can be provided to runtimes that support --tools <json-file>.
-        if path is not None:
-            return ensure_tools_schema_file(Path(path))
-        return ensure_tools_schema_file()
 
     def _on_anim_tick(self):
         self._phase = (self._phase + self._anim_timer.interval() / self._cycle_ms) % 1.0
@@ -958,34 +746,11 @@ class SpeechInputWindow(QWidget):
             local_mode=self._openclaw_local_mode,
             timeout_sec=self._openclaw_timeout_sec,
             thinking=self._openclaw_thinking,
-            max_tool_turns=self._openclaw_max_tool_turns,
-            tools_schema_path=self._openclaw_tools_schema_path,
-            tool_request_timeout_sec=self._openclaw_tool_request_timeout_sec,
         )
         self._openclaw_worker.done.connect(self._on_openclaw_done)
         self._openclaw_worker.failed.connect(self._on_openclaw_failed)
-        self._openclaw_worker.action_started.connect(self._on_openclaw_action_started)
-        self._openclaw_worker.sig_tool_request.connect(self._on_openclaw_tool_request)
         self._openclaw_worker.finished.connect(self._on_openclaw_finished)
         self._openclaw_worker.start()
-
-    def _on_openclaw_tool_request(self, tool_name: str, payload: Dict[str, Any], request_id: str):
-        self.tool_request.emit(str(tool_name or ""), dict(payload or {}), str(request_id or ""))
-
-    def submit_tool_result(self, request_id: str, ok: bool, result: Dict[str, Any]):
-        if self._openclaw_worker is None:
-            return
-        req_id = str(request_id or "").strip()
-        if not req_id:
-            return
-        payload = result if isinstance(result, dict) else {"value": result}
-        self._openclaw_worker.sig_tool_result.emit(req_id, bool(ok), payload)
-
-    def _on_openclaw_action_started(self, action_name: str):
-        action = str(action_name or "").strip() or "unknown"
-        self._status_text = f"正在执行动作: {action}..."
-        self.agent_action_started.emit(action)
-        self.update()
 
     def _on_openclaw_done(self, reply: str, session_id: str):
         reply_text = str(reply or "").strip()
