@@ -11,6 +11,8 @@
 
 > **开源计划：2026 年 3 月**（代码/硬件资料将在开源日统一放出）
 
+> **主页：** https://arm.moce.ai/
+
 [English](README.md) | [中文](README_ZH.md)
 
 ![SOARM-Moce Model Overview](images/1.JPG)
