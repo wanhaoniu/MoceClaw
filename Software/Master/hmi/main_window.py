@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import base64
+from collections import deque
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -148,6 +149,8 @@ class ArmControlGUI(QMainWindow):
     """Refactored HMI window with page navigation and camera tool window."""
 
     log_signal = pyqtSignal(str, str)
+    sdk_command_state_ready = pyqtSignal(object, str)
+    sdk_command_failed = pyqtSignal(str, str)
 
     PAGE_QUICK_MOVE = 0
     PAGE_JOB = 1
@@ -230,6 +233,10 @@ class ArmControlGUI(QMainWindow):
         self._sdk_auto_home_done = False
         self._sdk_last_gui_sync_ts = 0.0
         self._sdk_last_gui_sync_err_ts = 0.0
+        self._sdk_cmd_queue = deque()
+        self._sdk_cmd_cond = threading.Condition()
+        self._sdk_cmd_running = True
+        self._sdk_cmd_thread: Optional[threading.Thread] = None
         self._jog_hold_timer = QTimer(self)
         self._jog_hold_timer.setInterval(100)
         self._jog_hold_timer.timeout.connect(self._on_quick_jog_hold_tick)
@@ -243,6 +250,9 @@ class ArmControlGUI(QMainWindow):
         self.init_ui()
         self.setup_timers()
         self.log_signal.connect(self._append_log)
+        self.sdk_command_state_ready.connect(self._on_sdk_command_state_ready)
+        self.sdk_command_failed.connect(self._on_sdk_command_failed)
+        self._start_sdk_command_worker()
 
         self.refresh_positions()
         self.refresh_recordings()
@@ -924,26 +934,212 @@ class ArmControlGUI(QMainWindow):
         self.quick_page.speed_value.setText(f"{self.speed_percent}%")
         self._update_global_status_bar()
 
+    def _start_sdk_command_worker(self):
+        if self._sdk_cmd_thread is not None and self._sdk_cmd_thread.is_alive():
+            return
+        self._sdk_cmd_running = True
+        self._sdk_cmd_thread = threading.Thread(
+            target=self._sdk_command_loop,
+            name="soarmmoce-sdk-command-worker",
+            daemon=True,
+        )
+        self._sdk_cmd_thread.start()
+
+    def _stop_sdk_command_worker(self):
+        thread = self._sdk_cmd_thread
+        if thread is None:
+            return
+        with self._sdk_cmd_cond:
+            self._sdk_cmd_running = False
+            self._sdk_cmd_queue.clear()
+            self._sdk_cmd_cond.notify_all()
+        thread.join(timeout=2.0)
+        self._sdk_cmd_thread = None
+
+    def _drop_sdk_commands_locked(self, kinds: Tuple[str, ...]):
+        if not kinds:
+            return
+        self._sdk_cmd_queue = deque(
+            cmd for cmd in self._sdk_cmd_queue if str(cmd.get("kind", "")).strip() not in kinds
+        )
+
+    def _enqueue_sdk_command(self, command: Dict[str, Any], drop_kinds: Tuple[str, ...] = ()):
+        with self._sdk_cmd_cond:
+            if not self._sdk_cmd_running:
+                return
+            self._drop_sdk_commands_locked(tuple(str(kind) for kind in drop_kinds))
+            self._sdk_cmd_queue.append(dict(command))
+            self._sdk_cmd_cond.notify()
+
+    def _clear_pending_sdk_commands(self, *kinds: str):
+        with self._sdk_cmd_cond:
+            if kinds:
+                self._drop_sdk_commands_locked(tuple(str(kind) for kind in kinds))
+            else:
+                self._sdk_cmd_queue.clear()
+
+    def _sdk_command_loop(self):
+        while True:
+            with self._sdk_cmd_cond:
+                while self._sdk_cmd_running and not self._sdk_cmd_queue:
+                    self._sdk_cmd_cond.wait()
+                if not self._sdk_cmd_running and not self._sdk_cmd_queue:
+                    return
+                command = dict(self._sdk_cmd_queue.popleft())
+
+            source = str(command.get("source", "sdk")).strip() or "sdk"
+            try:
+                state = self._execute_sdk_command(command)
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                self.sdk_command_failed.emit(source, message)
+                continue
+
+            self.sdk_command_state_ready.emit(state, source)
+
+    def _execute_sdk_command(self, command: Dict[str, Any]) -> object:
+        kind = str(command.get("kind", "")).strip()
+        if kind == "joint_step":
+            return self._execute_sdk_joint_step(command)
+        if kind == "cartesian_jog":
+            return self._execute_sdk_cartesian_jog(command)
+        if kind == "home":
+            return self._execute_sdk_home(command)
+        if kind == "stop":
+            return self._execute_sdk_stop()
+        raise ValueError(f"Unknown SDK command: {kind}")
+
+    def _execute_sdk_joint_step(self, command: Dict[str, Any]) -> object:
+        idx = int(command["joint_index"])
+        delta = float(command["delta"])
+        duration = float(command["duration"])
+        if idx < 0:
+            raise ValueError("Joint index must be non-negative")
+
+        with self._sdk_lock:
+            robot = self._sdk_get_robot()
+            state_before = robot.get_state()
+            q_target = np.asarray(state_before.joint_state.q, dtype=float).copy()
+            if idx >= q_target.shape[0]:
+                raise ValueError(f"Joint index {idx} out of range")
+            lo, hi = robot.robot_model.joint_limits[idx]
+            q_target[idx] = float(np.clip(q_target[idx] + delta, float(lo), float(hi)))
+            robot.move_joints(q_target, duration=duration, wait=False)
+            return robot.get_state()
+
+    def _execute_sdk_cartesian_jog(self, command: Dict[str, Any]) -> object:
+        key_norm = str(command["key"])
+        trans_map = {
+            "+X": np.array([1.0, 0.0, 0.0], dtype=float),
+            "-X": np.array([-1.0, 0.0, 0.0], dtype=float),
+            "+Y": np.array([0.0, 1.0, 0.0], dtype=float),
+            "-Y": np.array([0.0, -1.0, 0.0], dtype=float),
+            "+Z": np.array([0.0, 0.0, 1.0], dtype=float),
+            "-Z": np.array([0.0, 0.0, -1.0], dtype=float),
+        }
+        rot_map = {
+            "+RX": np.array([1.0, 0.0, 0.0], dtype=float),
+            "-RX": np.array([-1.0, 0.0, 0.0], dtype=float),
+            "+RY": np.array([0.0, 1.0, 0.0], dtype=float),
+            "-RY": np.array([0.0, -1.0, 0.0], dtype=float),
+            "+RZ": np.array([0.0, 0.0, 1.0], dtype=float),
+            "-RZ": np.array([0.0, 0.0, -1.0], dtype=float),
+        }
+        if key_norm not in trans_map and key_norm not in rot_map:
+            raise ValueError(f"Unsupported jog key: {key_norm}")
+
+        step_mm = float(command["step_mm"])
+        step_rad = float(command["step_rad"])
+        duration = float(command["duration"])
+        use_tool = bool(command.get("use_tool", False))
+
+        delta_pos_local = np.zeros(3, dtype=float)
+        delta_rot_local = np.zeros(3, dtype=float)
+        if key_norm in trans_map:
+            delta_pos_local = trans_map[key_norm] * (step_mm / 1000.0)
+        else:
+            delta_rot_local = rot_map[key_norm] * step_rad
+
+        with self._sdk_lock:
+            robot = self._sdk_get_robot()
+            state_before = robot.get_state()
+            xyz_now = np.asarray(state_before.tcp_pose.xyz, dtype=float)
+            rpy_now = np.asarray(state_before.tcp_pose.rpy, dtype=float)
+            R_now = self._rpy_to_rotmat(rpy_now)
+            if use_tool:
+                target_xyz = np.asarray(xyz_now, dtype=float) + (R_now @ delta_pos_local)
+                R_target = R_now @ self._rotvec_to_rotmat(delta_rot_local)
+            else:
+                target_xyz = np.asarray(xyz_now, dtype=float) + delta_pos_local
+                R_target = self._rotvec_to_rotmat(delta_rot_local) @ R_now
+            target_rpy = self._rotmat_to_rpy(R_target)
+            robot.move_pose(
+                xyz=target_xyz,
+                rpy=target_rpy,
+                duration=duration,
+                wait=False,
+            )
+            return robot.get_state()
+
+    def _execute_sdk_home(self, command: Dict[str, Any]) -> object:
+        duration = float(command["duration"])
+        with self._sdk_lock:
+            robot = self._sdk_get_robot()
+            robot.home(duration=duration, wait=False)
+            return robot.get_state()
+
+    def _execute_sdk_stop(self) -> object:
+        with self._sdk_lock:
+            robot = self._sdk_get_robot()
+            robot.stop()
+            return robot.get_state()
+
+    @staticmethod
+    def _sdk_command_label(source: str) -> str:
+        src = str(source or "").strip()
+        if src.startswith("home:"):
+            return f"SDK {src.split(':', 1)[1]}"
+        if src.startswith("joint:"):
+            return "Quick Joint"
+        if src.startswith("jog:"):
+            return "Quick Jog"
+        if src == "stop":
+            return "SDK stop"
+        return f"SDK {src}" if src else "SDK"
+
+    def _on_sdk_command_state_ready(self, state: object, source: str):
+        self._sync_sim_from_sdk_state(state)
+        self._sdk_last_gui_sync_ts = time.time()
+        src = str(source or "").strip()
+        if src.startswith("home:"):
+            self.statusBar().showMessage("Robot moved to zero")
+            self.log(f"[{self._sdk_command_label(src)}] moved to zero", "success")
+        elif src == "stop":
+            self.statusBar().showMessage("Robot stopped")
+
+    def _on_sdk_command_failed(self, source: str, message: str):
+        label = self._sdk_command_label(source)
+        msg = str(message or "").strip() or "Command failed"
+        self.statusBar().showMessage(f"{label} failed: {msg}")
+        self.log(f"[{label}] {msg}", "warning")
+
     def _on_quick_joint_step(self, idx: int, direction: float):
         if idx < 0:
             return
         step_deg = max(0.1, float(self.quick_page.step_angle_spin.value()))
         delta = math.radians(step_deg) * float(direction)
-        try:
-            robot = self._sdk_get_robot()
-            state_before = robot.get_state()
-            q_target = np.asarray(state_before.joint_state.q, dtype=float).copy()
-            if idx >= q_target.shape[0]:
-                return
-            lo, hi = robot.robot_model.joint_limits[idx]
-            q_target[idx] = float(np.clip(q_target[idx] + float(delta), float(lo), float(hi)))
-            speed_scale = max(0.1, float(self.speed_percent) / 100.0)
-            duration = float(np.clip(0.6 / speed_scale, 0.2, 2.0))
-            robot.move_joints(q_target, duration=duration, wait=True)
-            state_after = robot.get_state()
-            self._sync_sim_from_sdk_state(state_after)
-        except Exception as exc:
-            self.log(f"[Quick Joint] {exc}", "warning")
+        speed_scale = max(0.1, float(self.speed_percent) / 100.0)
+        duration = float(np.clip(0.6 / speed_scale, 0.2, 2.0))
+        self._enqueue_sdk_command(
+            {
+                "kind": "joint_step",
+                "source": "joint:step",
+                "joint_index": int(idx),
+                "delta": float(delta),
+                "duration": duration,
+            },
+            drop_kinds=("stop",),
+        )
 
     def _quick_jog_mode_is_continuous(self) -> bool:
         combo = getattr(self.quick_page, "step_mode_combo", None)
@@ -960,10 +1156,16 @@ class ArmControlGUI(QMainWindow):
         self._apply_quick_cartesian_jog(self._jog_hold_key)
         self._jog_hold_timer.start()
 
-    def _on_quick_jog_released(self):
+    def _on_quick_jog_released(self, enqueue_stop: bool = True):
+        was_holding = bool(self._jog_hold_key) or self._jog_hold_timer.isActive()
         self._jog_hold_key = None
         if self._jog_hold_timer.isActive():
             self._jog_hold_timer.stop()
+        if not was_holding and enqueue_stop:
+            return
+        self._clear_pending_sdk_commands("cartesian_jog")
+        if enqueue_stop and was_holding:
+            self._enqueue_sdk_command({"kind": "stop", "source": "stop"}, drop_kinds=("stop",))
 
     def _on_quick_jog_clicked(self, key: str):
         if self._quick_jog_mode_is_continuous():
@@ -1178,43 +1380,29 @@ class ArmControlGUI(QMainWindow):
 
         step_mm = max(0.1, float(self.quick_page.step_dist_spin.value()))
         step_rad = math.radians(max(0.1, float(self.quick_page.step_angle_spin.value())))
-        delta_pos_local = np.zeros(3, dtype=float)
-        delta_rot_local = np.zeros(3, dtype=float)
-        if key_norm in trans_map:
-            delta_pos_local = trans_map[key_norm] * (step_mm / 1000.0)
-        else:
-            delta_rot_local = rot_map[key_norm] * step_rad
-
         coord_mode = str(self.quick_page.coord_combo.currentText()).strip().lower()
         use_tool = coord_mode.startswith("tool")
-        try:
-            robot = self._sdk_get_robot()
-            state_before = robot.get_state()
-            xyz_now = np.asarray(state_before.tcp_pose.xyz, dtype=float)
-            rpy_now = np.asarray(state_before.tcp_pose.rpy, dtype=float)
-            R_now = self._rpy_to_rotmat(rpy_now)
-            if use_tool:
-                target_xyz = np.asarray(xyz_now, dtype=float) + (R_now @ delta_pos_local)
-                R_target = R_now @ self._rotvec_to_rotmat(delta_rot_local)
-            else:
-                target_xyz = np.asarray(xyz_now, dtype=float) + delta_pos_local
-                R_target = self._rotvec_to_rotmat(delta_rot_local) @ R_now
-            target_rpy = self._rotmat_to_rpy(R_target)
-            speed_scale = max(0.1, float(self.speed_percent) / 100.0)
+        speed_scale = max(0.1, float(self.speed_percent) / 100.0)
+        if self._quick_jog_mode_is_continuous():
+            duration = float(np.clip(0.15 / speed_scale, 0.08, 0.5))
+        else:
             duration = float(np.clip(0.6 / speed_scale, 0.2, 2.0))
-            robot.move_pose(
-                xyz=target_xyz,
-                rpy=target_rpy,
-                duration=duration,
-                wait=True,
-            )
-            state_after = robot.get_state()
-            self._sync_sim_from_sdk_state(state_after)
-        except Exception as exc:
-            self.log(f"[Quick Jog] {exc}", "warning")
+
+        self._enqueue_sdk_command(
+            {
+                "kind": "cartesian_jog",
+                "source": f"jog:{key_norm}",
+                "key": key_norm,
+                "step_mm": float(step_mm),
+                "step_rad": float(step_rad),
+                "use_tool": bool(use_tool),
+                "duration": duration,
+            },
+            drop_kinds=("cartesian_jog", "stop"),
+        )
 
     def _sdk_home_and_sync(self, duration: Optional[float] = None, source: str = "home") -> bool:
-        self._on_quick_jog_released()
+        self._on_quick_jog_released(enqueue_stop=False)
         try:
             robot = self._sdk_get_robot()
             speed_scale = max(0.1, float(self.speed_percent) / 100.0)
@@ -1231,6 +1419,19 @@ class ArmControlGUI(QMainWindow):
             self.log(f"[SDK {source}] {exc}", "warning")
             return False
 
+    def _enqueue_sdk_home(self, duration: Optional[float] = None, source: str = "home"):
+        self._on_quick_jog_released(enqueue_stop=False)
+        self._clear_pending_sdk_commands()
+        speed_scale = max(0.1, float(self.speed_percent) / 100.0)
+        duration_val = float(duration) if duration is not None else float(np.clip(1.8 / speed_scale, 0.5, 5.0))
+        self._enqueue_sdk_command(
+            {
+                "kind": "home",
+                "source": f"home:{source}",
+                "duration": duration_val,
+            }
+        )
+
     def _auto_home_after_startup(self):
         if self._sdk_auto_home_done:
             return
@@ -1238,10 +1439,10 @@ class ArmControlGUI(QMainWindow):
         self._sdk_home_and_sync(duration=self._sdk_auto_home_duration_sec, source="startup")
 
     def _on_quick_origin(self):
-        self._sdk_home_and_sync(source="origin")
+        self._enqueue_sdk_home(source="origin")
 
     def _on_quick_zero(self):
-        self._sdk_home_and_sync(source="zero")
+        self._enqueue_sdk_home(source="zero")
 
     def _on_quick_free_move(self):
         combo = getattr(self.quick_page, "step_mode_combo", None)
@@ -1603,24 +1804,28 @@ class ArmControlGUI(QMainWindow):
         if not self._sim_ready or not self._sdk_gui_sync_enabled:
             return False
         if self.connected and self.client:
-            # ArmClient-connected mode keeps its own update path.
             return False
 
         now = time.time()
         if (not force) and (now - float(self._sdk_last_gui_sync_ts) < float(self._sdk_gui_sync_interval_sec)):
             return False
 
+        if not self._sdk_lock.acquire(blocking=False):
+            return False
         try:
             robot = self._sdk_get_robot()
             state = robot.get_state()
-            self._sync_sim_from_sdk_state(state)
-            self._sdk_last_gui_sync_ts = now
-            return True
         except Exception as exc:
             if now - float(self._sdk_last_gui_sync_err_ts) >= 5.0:
                 self._sdk_last_gui_sync_err_ts = now
                 self.log(f"[SDK sync] {exc}", "warning")
             return False
+        finally:
+            self._sdk_lock.release()
+
+        self._sync_sim_from_sdk_state(state)
+        self._sdk_last_gui_sync_ts = now
+        return True
 
     def _tool_find_joint_index(self, joint_name: str) -> Optional[int]:
         key = str(joint_name or "").strip().lower()
@@ -1826,7 +2031,7 @@ class ArmControlGUI(QMainWindow):
 
     def _tool_stop_robot_main_thread(self) -> Tuple[bool, Dict[str, object]]:
         try:
-            self._on_quick_jog_released()
+            self._on_quick_jog_released(enqueue_stop=False)
         except Exception:
             pass
         try:
@@ -2286,9 +2491,11 @@ class ArmControlGUI(QMainWindow):
         self._update_global_status_bar()
 
     def on_disconnect(self):
-        if not self.connected and not self.connecting:
+        if not self.connected and not self.connecting and self._sdk_robot is None:
             return
 
+        self._on_quick_jog_released(enqueue_stop=False)
+        self._clear_pending_sdk_commands()
         self.log(self._tr("log_disconnecting"))
 
         if self.video_thread:
@@ -2337,7 +2544,7 @@ class ArmControlGUI(QMainWindow):
         self._update_global_status_bar()
 
     def on_home(self):
-        self._sdk_home_and_sync(source="legacy-home")
+        self._enqueue_sdk_home(source="legacy-home")
 
     # ==================== Camera frames ====================
 
@@ -3018,7 +3225,7 @@ class ArmControlGUI(QMainWindow):
         self.sim_view_label.setPixmap(QPixmap.fromImage(qimg))
 
     def _cleanup_sim_backend(self):
-        self._on_quick_jog_released()
+        self._on_quick_jog_released(enqueue_stop=False)
 
         if self.sim_vtk_view is not None:
             try:
@@ -3116,9 +3323,12 @@ class ArmControlGUI(QMainWindow):
         if self.speech_window is not None:
             self.speech_window.close()
 
+        self._on_quick_jog_released(enqueue_stop=False)
+        self._stop_sdk_command_worker()
         self._sdk_disconnect_robot()
         self._cleanup_sim_backend()
         event.accept()
+
 
 
 def main():
