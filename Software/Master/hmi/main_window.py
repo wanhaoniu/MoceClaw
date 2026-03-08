@@ -214,6 +214,20 @@ class ArmControlGUI(QMainWindow):
             )
         except Exception:
             self._sdk_gui_sync_interval_sec = 0.5
+        self._sdk_auto_home_on_start = str(os.getenv("SOARMMOCE_AUTO_HOME_ON_START", "1")).strip().lower() not in (
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+        try:
+            self._sdk_auto_home_duration_sec = max(
+                0.2,
+                float(str(os.getenv("SOARMMOCE_AUTO_HOME_DURATION", "1.0")).strip()),
+            )
+        except Exception:
+            self._sdk_auto_home_duration_sec = 1.0
+        self._sdk_auto_home_done = False
         self._sdk_last_gui_sync_ts = 0.0
         self._sdk_last_gui_sync_err_ts = 0.0
         self._jog_hold_timer = QTimer(self)
@@ -235,6 +249,8 @@ class ArmControlGUI(QMainWindow):
         self._apply_language()
         self._update_connection_widgets()
         self._update_global_status_bar()
+        if self._sdk_auto_home_on_start:
+            QTimer.singleShot(0, self._auto_home_after_startup)
 
     def _build_translations(self):
         return {
@@ -710,7 +726,7 @@ class ArmControlGUI(QMainWindow):
 
     def _bind_signals(self):
         self.quick_page.speed_changed.connect(self.on_speed_changed)
-        self.quick_page.home_clicked.connect(self.on_home)
+        self.quick_page.home_clicked.connect(self._on_quick_zero)
 
         self.job_page.save_pos_btn.clicked.connect(self.on_save_pos)
         self.job_page.goto_btn.clicked.connect(self.on_goto_pos)
@@ -1197,18 +1213,35 @@ class ArmControlGUI(QMainWindow):
         except Exception as exc:
             self.log(f"[Quick Jog] {exc}", "warning")
 
-    def _on_quick_origin(self):
+    def _sdk_home_and_sync(self, duration: Optional[float] = None, source: str = "home") -> bool:
         self._on_quick_jog_released()
         try:
             robot = self._sdk_get_robot()
             speed_scale = max(0.1, float(self.speed_percent) / 100.0)
-            duration = float(np.clip(1.8 / speed_scale, 0.5, 5.0))
-            robot.home(duration=duration, wait=True)
+            duration_val = float(duration) if duration is not None else float(np.clip(1.8 / speed_scale, 0.5, 5.0))
+            robot.home(duration=duration_val, wait=True)
             state_after = robot.get_state()
             self._sync_sim_from_sdk_state(state_after)
-            self.statusBar().showMessage("Robot moved to home")
+            self._sdk_last_gui_sync_ts = time.time()
+            self.statusBar().showMessage("Robot moved to zero")
+            self.log(f"[SDK {source}] moved to zero", "success")
+            return True
         except Exception as exc:
-            self.log(f"[Quick Home] {exc}", "warning")
+            self.statusBar().showMessage(f"Home failed: {exc}")
+            self.log(f"[SDK {source}] {exc}", "warning")
+            return False
+
+    def _auto_home_after_startup(self):
+        if self._sdk_auto_home_done:
+            return
+        self._sdk_auto_home_done = True
+        self._sdk_home_and_sync(duration=self._sdk_auto_home_duration_sec, source="startup")
+
+    def _on_quick_origin(self):
+        self._sdk_home_and_sync(source="origin")
+
+    def _on_quick_zero(self):
+        self._sdk_home_and_sync(source="zero")
 
     def _on_quick_free_move(self):
         combo = getattr(self.quick_page, "step_mode_combo", None)
@@ -2304,31 +2337,7 @@ class ArmControlGUI(QMainWindow):
         self._update_global_status_bar()
 
     def on_home(self):
-        if not self.client:
-            if self._sim_ready:
-                self._on_sim_reset()
-                self.statusBar().showMessage("Simulation reset to zero")
-            return
-
-        reply = QMessageBox.question(
-            self,
-            self._tr("msg_confirm"),
-            self._tr("msg_confirm_home"),
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        self.log(self._tr("log_home_start"))
-
-        def home_task():
-            success = self.client.return_to_zero(3.0)
-            if success:
-                self.log(self._tr("log_home_done"), "success")
-            else:
-                self.log(self._tr("log_home_failed"), "error")
-
-        threading.Thread(target=home_task, daemon=True).start()
+        self._sdk_home_and_sync(source="legacy-home")
 
     # ==================== Camera frames ====================
 
