@@ -16,6 +16,9 @@ metadata:
 - 代码结构分成两层：
   - `scripts/soarmmoce_sdk.py`：SDK 风格控制逻辑
   - `scripts/soarmmoce_state.py` / `scripts/soarmmoce_move.py`：命令行入口
+- 当前 TCP 笛卡尔控制按 `5DOF position-only IK` 工作，只解末端位置 `x/y/z`，不再强行约束完整 6D 姿态。
+- 对 `delta/xyz` 这类笛卡尔移动，默认锁住 `wrist_roll`，避免横移时为了凑位置把末端滚转甩开。
+- 轨迹下发默认按时间频率连续插值，并使用平滑缓入缓出，避免单步跳变太大导致动作发卡。
 - 2 号关节 `shoulder_lift` 与 3 号关节 `elbow_flex` 已分别按减速比 `5.3 / 5.6` 做换算，底层运行在多圈模式。
 - 当前机械臂没有安装 6 号夹爪舵机，不要调用夹爪脚本或夹爪 API。
 
@@ -103,13 +106,21 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 - `SOARMMOCE_PORT`：串口，默认 `/dev/ttyACM0`
 - `SOARMMOCE_ROBOT_ID`：标定 ID，默认 `follower_moce`
 - `SOARMMOCE_CALIB_DIR`：标定目录
-- `SOARMMOCE_URDF_PATH`：URDF 路径
-- `SOARMMOCE_TARGET_FRAME`：末端 frame，默认 `gripper_frame_link`
+- `SOARMMOCE_URDF_PATH`：URDF 路径，默认优先使用 `sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf`
+- `SOARMMOCE_TARGET_FRAME`：末端 frame，默认 `wrist_roll`（按当前 5DOF 链截断）
 - `SOARMMOCE_HOME_JOINTS_JSON`：覆盖 home 目标关节
 - `SOARMMOCE_JOINT_SCALE_JSON`：覆盖关节减速比/方向，默认 `{"shoulder_pan":1.0,"shoulder_lift":5.3,"elbow_flex":5.6,"wrist_flex":1.0,"wrist_roll":1.0}`
 - `SOARMMOCE_LINEAR_STEP_M`：笛卡尔插值步长，默认 `0.01`
 - `SOARMMOCE_JOINT_STEP_DEG`：关节插值步长，默认 `5.0`
-- `SOARMMOCE_MAX_EE_POS_ERR_M`：IK 位置误差容忍，默认 `0.03`
+- `SOARMMOCE_CARTESIAN_UPDATE_HZ`：笛卡尔轨迹下发频率，默认 `20.0`
+- `SOARMMOCE_JOINT_UPDATE_HZ`：关节轨迹下发频率，默认 `25.0`
+- `SOARMMOCE_MAX_EE_POS_ERR_M`：笛卡尔动作最终位置误差容忍，默认 `0.01`
+- `SOARMMOCE_IK_TARGET_TOL_M`：5DOF IK 收敛阈值，默认 `0.001`
+- `SOARMMOCE_IK_MAX_ITERS`：5DOF IK 最大迭代次数，默认 `200`
+- `SOARMMOCE_IK_DAMPING`：5DOF IK 阻尼系数，默认 `0.05`
+- `SOARMMOCE_IK_STEP_SCALE`：5DOF IK 每轮步进缩放，默认 `0.8`
+- `SOARMMOCE_IK_JOINT_STEP_DEG`：5DOF IK 单轮单关节最大步长，默认 `8.0`
+- `SOARMMOCE_IK_SEED_BIAS`：5DOF IK 保持当前姿态的偏置强度，默认 `0.02`
 - `SOARMMOCE_ARM_P_COEFFICIENT`：单圈关节 P 参数，默认 `16`
 - `SOARMMOCE_ARM_D_COEFFICIENT`：单圈关节 D 参数，默认 `8`
 

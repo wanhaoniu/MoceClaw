@@ -19,7 +19,6 @@ import kinpy as kp
 import numpy as np
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
-from scipy.spatial.transform import Rotation as R
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -32,9 +31,10 @@ JOINTS = [
 ]
 ARM_JOINTS = list(JOINTS)
 MULTI_TURN_JOINTS = ("shoulder_lift", "elbow_flex")
+LOCKED_CARTESIAN_JOINTS = ("wrist_roll",)
 MULTI_TURN_RAW_RANGE = 900000
 RAW_COUNTS_PER_REV = 4096.0
-DEFAULT_TARGET_FRAME = "gripper_frame_link"
+DEFAULT_TARGET_FRAME = "wrist_roll"
 DEFAULT_HOME_JOINTS = {
     "shoulder_pan": -8.923076923076923,
     "shoulder_lift": -9.31868131868132,
@@ -86,9 +86,17 @@ class SoArmMoceConfig:
     arm_p_coefficient: int
     arm_d_coefficient: int
     max_ee_pos_err_m: float
-    max_ee_ang_err_rad: float
     linear_step_m: float
     joint_step_deg: float
+    cartesian_settle_time_s: float
+    cartesian_update_hz: float
+    joint_update_hz: float
+    ik_target_tol_m: float
+    ik_max_iters: int
+    ik_damping: float
+    ik_step_scale: float
+    ik_joint_step_deg: float
+    ik_seed_bias: float
 
 
 def _env_value(*keys: str, default: str = "") -> str:
@@ -144,9 +152,9 @@ def _candidate_urdf_paths() -> list[Path]:
         candidates.append(Path(env).expanduser())
     candidates.extend(
         [
-            REPO_ROOT / "Software/Master/so101.urdf",
-            Path.cwd() / "Software/Master/so101.urdf",
-            Path.home() / "Code/SO-ARM-Moce/Software/Master/so101.urdf",
+            REPO_ROOT / "sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf",
+            Path.cwd() / "sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf",
+            Path.home() / "Code/SO-ARM-Moce/sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf",
         ]
     )
     unique: list[Path] = []
@@ -242,10 +250,18 @@ def resolve_config() -> SoArmMoceConfig:
         joint_scales=_resolve_joint_scales(),
         arm_p_coefficient=int(_env_value("SOARMMOCE_ARM_P_COEFFICIENT", default="16")),
         arm_d_coefficient=int(_env_value("SOARMMOCE_ARM_D_COEFFICIENT", default="8")),
-        max_ee_pos_err_m=float(_env_value("SOARMMOCE_MAX_EE_POS_ERR_M", default="0.03")),
-        max_ee_ang_err_rad=float(_env_value("SOARMMOCE_MAX_EE_ANG_ERR_RAD", default="0.05")),
+        max_ee_pos_err_m=float(_env_value("SOARMMOCE_MAX_EE_POS_ERR_M", default="0.01")),
         linear_step_m=float(_env_value("SOARMMOCE_LINEAR_STEP_M", default="0.01")),
         joint_step_deg=float(_env_value("SOARMMOCE_JOINT_STEP_DEG", default="5.0")),
+        cartesian_settle_time_s=float(_env_value("SOARMMOCE_CARTESIAN_SETTLE_TIME_S", default="0.15")),
+        cartesian_update_hz=float(_env_value("SOARMMOCE_CARTESIAN_UPDATE_HZ", default="20.0")),
+        joint_update_hz=float(_env_value("SOARMMOCE_JOINT_UPDATE_HZ", default="25.0")),
+        ik_target_tol_m=float(_env_value("SOARMMOCE_IK_TARGET_TOL_M", default="0.001")),
+        ik_max_iters=int(_env_value("SOARMMOCE_IK_MAX_ITERS", default="200")),
+        ik_damping=float(_env_value("SOARMMOCE_IK_DAMPING", default="0.05")),
+        ik_step_scale=float(_env_value("SOARMMOCE_IK_STEP_SCALE", default="0.8")),
+        ik_joint_step_deg=float(_env_value("SOARMMOCE_IK_JOINT_STEP_DEG", default="8.0")),
+        ik_seed_bias=float(_env_value("SOARMMOCE_IK_SEED_BIAS", default="0.02")),
     )
 
 
@@ -309,6 +325,8 @@ class SoArmMoceController:
             "joint_names": list(JOINTS),
             "multi_turn_joints": list(MULTI_TURN_JOINTS),
             "joint_scales": dict(self.config.joint_scales),
+            "ik_mode": "5dof_position_only",
+            "cartesian_locked_joints": list(LOCKED_CARTESIAN_JOINTS),
             "gripper_available": False,
         }
 
@@ -359,7 +377,6 @@ class SoArmMoceController:
         state = self._move_tcp_smooth(
             start_state=before,
             target_pos=target_pos,
-            target_rot=current_tf.rot,
             duration=duration,
             wait=wait,
             timeout=timeout,
@@ -398,7 +415,6 @@ class SoArmMoceController:
         state = self._move_tcp_smooth(
             start_state=before,
             target_pos=target_pos,
-            target_rot=current_tf.rot,
             duration=duration,
             wait=wait,
             timeout=timeout,
@@ -426,9 +442,11 @@ class SoArmMoceController:
         before = self.get_state()
         current = float(before["joint_state"][joint_name])
         target = float(current + float(delta_deg)) if delta_deg is not None else float(target_deg)
+        target_cmd = {name: float(before["joint_state"][name]) for name in JOINTS}
+        target_cmd[joint_name] = target
         state = self._move_joint_targets_smooth(
             start_state=before,
-            target_cmd={joint_name: target},
+            target_cmd=target_cmd,
             duration=duration,
             wait=wait,
             timeout=timeout,
@@ -452,7 +470,7 @@ class SoArmMoceController:
         if not isinstance(targets_deg, dict) or not targets_deg:
             raise ValidationError("targets_deg must be a non-empty object")
         before = self.get_state()
-        cmd: Dict[str, float] = {}
+        cmd: Dict[str, float] = {name: float(before["joint_state"][name]) for name in JOINTS}
         for raw_joint, raw_value in targets_deg.items():
             joint = self._validate_joint_name(str(raw_joint))
             if not isinstance(raw_value, (int, float)):
@@ -602,26 +620,99 @@ class SoArmMoceController:
         q_rad = np.deg2rad(np.asarray(q_arm_deg, dtype=float).reshape(-1))
         return chain.forward_kinematics(q_rad)
 
-    def _solve_ik_to_pose(self, target_tf: kp.Transform, q_seed_deg: np.ndarray) -> Dict[str, Any]:
+    def _solve_ik_to_position(
+        self,
+        target_pos: np.ndarray,
+        q_seed_deg: np.ndarray,
+        locked_joint_targets_deg: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
         chain = self._ensure_kin_chain()
         q_seed_deg = np.asarray(q_seed_deg, dtype=float).reshape(-1)
+        if q_seed_deg.shape[0] != len(ARM_JOINTS):
+            raise IKError(f"Expected {len(ARM_JOINTS)} seed joints, got {q_seed_deg.shape[0]}")
+
         q_seed_rad = np.deg2rad(q_seed_deg)
-        q_target_rad = np.asarray(chain.inverse_kinematics(target_tf, initial_state=q_seed_rad), dtype=float).reshape(-1)
-        if q_target_rad.shape[0] != len(ARM_JOINTS) or not np.all(np.isfinite(q_target_rad)):
-            raise IKError("IK solver returned invalid joint values")
-        q_target_deg = np.rad2deg(q_target_rad)
-        solved_tf = chain.forward_kinematics(q_target_rad)
-        pos_err = float(np.linalg.norm(np.asarray(solved_tf.pos) - np.asarray(target_tf.pos)))
-        r_target = R.from_quat([target_tf.rot[1], target_tf.rot[2], target_tf.rot[3], target_tf.rot[0]])
-        r_solved = R.from_quat([solved_tf.rot[1], solved_tf.rot[2], solved_tf.rot[3], solved_tf.rot[0]])
-        ang_err = float(np.linalg.norm((r_solved * r_target.inv()).as_rotvec()))
-        if pos_err > self.config.max_ee_pos_err_m:
-            raise IKError(
-                f"IK position error too large: {pos_err:.6f} m (limit {self.config.max_ee_pos_err_m:.6f} m)"
-            )
-        if ang_err > self.config.max_ee_ang_err_rad:
-            raise IKError(f"IK orientation error too large: {ang_err:.6f} rad")
-        return {"q_target_deg": q_target_deg}
+        target_pos = np.asarray(target_pos, dtype=float).reshape(3)
+        q_current = q_seed_rad.copy()
+        locked_joint_targets_deg = dict(locked_joint_targets_deg or {})
+        locked_indices = []
+        for joint_name, joint_target_deg in locked_joint_targets_deg.items():
+            if joint_name not in ARM_JOINTS:
+                raise IKError(f"Cannot lock non-arm joint in IK: {joint_name}")
+            idx = ARM_JOINTS.index(joint_name)
+            q_current[idx] = np.deg2rad(float(joint_target_deg))
+            locked_indices.append(idx)
+        active_indices = [idx for idx in range(len(ARM_JOINTS)) if idx not in locked_indices]
+        if not active_indices:
+            raise IKError("No active joints left for IK solve")
+
+        damping = max(1e-6, float(self.config.ik_damping))
+        step_scale = max(1e-3, float(self.config.ik_step_scale))
+        max_step_rad = np.deg2rad(max(0.1, float(self.config.ik_joint_step_deg)))
+        seed_bias = max(0.0, float(self.config.ik_seed_bias))
+        solve_tol_m = max(1e-5, float(self.config.ik_target_tol_m))
+        failure_tol_m = max(solve_tol_m, float(self.config.max_ee_pos_err_m))
+        identity_pos = np.eye(3, dtype=float)
+        identity_joint = np.eye(len(active_indices), dtype=float)
+
+        best_q = q_current.copy()
+        best_err = float("inf")
+
+        for iteration in range(1, max(1, int(self.config.ik_max_iters)) + 1):
+            current_tf = chain.forward_kinematics(q_current)
+            current_pos = np.asarray(current_tf.pos, dtype=float)
+            pos_err_vec = target_pos - current_pos
+            pos_err = float(np.linalg.norm(pos_err_vec))
+            if pos_err < best_err:
+                best_err = pos_err
+                best_q = q_current.copy()
+            if pos_err <= solve_tol_m:
+                return {
+                    "q_target_deg": np.rad2deg(q_current),
+                    "pos_err_m": pos_err,
+                    "iterations": iteration,
+                }
+
+            jacobian_full = np.asarray(chain.jacobian(q_current), dtype=float)[:3, :]
+            if jacobian_full.shape != (3, len(ARM_JOINTS)):
+                raise IKError(f"Unexpected Jacobian shape: {jacobian_full.shape}")
+            jacobian_pos = jacobian_full[:, active_indices]
+            if jacobian_pos.shape != (3, len(active_indices)):
+                raise IKError(f"Unexpected Jacobian shape: {jacobian_pos.shape}")
+
+            jj_t = jacobian_pos @ jacobian_pos.T
+            damped_system = jj_t + (damping**2) * identity_pos
+            try:
+                primary_step = jacobian_pos.T @ np.linalg.solve(damped_system, pos_err_vec)
+                if seed_bias > 0.0:
+                    null_projector = identity_joint - (jacobian_pos.T @ np.linalg.solve(damped_system, jacobian_pos))
+                    secondary_step = null_projector @ (q_seed_rad[active_indices] - q_current[active_indices])
+                else:
+                    secondary_step = np.zeros(len(active_indices), dtype=float)
+            except np.linalg.LinAlgError as exc:
+                raise IKError(f"IK linear solve failed: {exc}") from exc
+
+            joint_step_active = (primary_step + seed_bias * secondary_step) * step_scale
+            joint_step_active = np.clip(joint_step_active, -max_step_rad, max_step_rad)
+            if not np.all(np.isfinite(joint_step_active)):
+                raise IKError("IK solver produced non-finite joint update")
+            if np.linalg.norm(joint_step_active) < 1e-9:
+                break
+            q_current = q_current.copy()
+            q_current[active_indices] = q_current[active_indices] + joint_step_active
+            for idx in locked_indices:
+                q_current[idx] = np.deg2rad(float(locked_joint_targets_deg[ARM_JOINTS[idx]]))
+
+        if best_err <= failure_tol_m:
+            return {
+                "q_target_deg": np.rad2deg(best_q),
+                "pos_err_m": best_err,
+                "iterations": int(self.config.ik_max_iters),
+            }
+        raise IKError(
+            f"5DOF IK position error too large: {best_err:.6f} m "
+            f"(limit {failure_tol_m:.6f} m)"
+        )
 
     def _joint_scale(self, joint_name: str) -> float:
         return float(self.config.joint_scales.get(joint_name, 1.0))
@@ -679,33 +770,56 @@ class SoArmMoceController:
         *,
         start_state: Dict[str, Any],
         target_pos: np.ndarray,
-        target_rot: Any,
         duration: float,
         wait: bool,
         timeout: Optional[float],
     ) -> Dict[str, Any]:
         start_xyz = np.asarray(start_state["tcp_pose"]["xyz"], dtype=float)
         q_seed_deg = self._state_to_arm_q_deg(start_state)
+        locked_joint_targets_deg = {
+            joint_name: float(start_state["joint_state"][joint_name]) for joint_name in LOCKED_CARTESIAN_JOINTS
+        }
         if not wait:
-            ik = self._solve_ik_to_pose(kp.Transform(rot=target_rot, pos=target_pos), q_seed_deg)
+            ik = self._solve_ik_to_position(target_pos, q_seed_deg, locked_joint_targets_deg=locked_joint_targets_deg)
             cmd = {name: float(ik["q_target_deg"][idx]) for idx, name in enumerate(ARM_JOINTS)}
             return self._move_goal(cmd, duration=duration, wait=False, timeout=timeout)
 
         step_m = max(1e-4, float(self.config.linear_step_m))
         distance = float(np.linalg.norm(target_pos - start_xyz))
-        steps = max(1, int(np.ceil(distance / step_m)))
+        hz_steps = int(np.ceil(max(0.0, float(duration)) * max(1.0, float(self.config.cartesian_update_hz))))
+        steps = max(1, int(np.ceil(distance / step_m)), hz_steps)
         step_duration = max(0.0, float(duration)) / steps if steps else 0.0
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         state = start_state
         for step_index in range(1, steps + 1):
-            alpha = float(step_index) / float(steps)
+            alpha = self._smooth_fraction(float(step_index) / float(steps))
             waypoint_pos = start_xyz + (target_pos - start_xyz) * alpha
-            ik = self._solve_ik_to_pose(kp.Transform(rot=target_rot, pos=waypoint_pos), q_seed_deg)
-            q_seed_deg = np.asarray(ik["q_target_deg"], dtype=float)
+            ik = self._solve_ik_to_position(
+                waypoint_pos,
+                q_seed_deg,
+                locked_joint_targets_deg=locked_joint_targets_deg,
+            )
             cmd = {name: float(ik["q_target_deg"][idx]) for idx, name in enumerate(ARM_JOINTS)}
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             state = self._move_goal(cmd, duration=step_duration, wait=True, timeout=remaining)
-        return self._hold_current_pose()
+            q_seed_deg = self._state_to_arm_q_deg(state)
+
+        final_state = self._hold_current_pose()
+        if self.config.cartesian_settle_time_s > 0.0:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            settle_time = float(self.config.cartesian_settle_time_s)
+            if remaining is not None:
+                settle_time = min(settle_time, remaining)
+            if settle_time > 0.0:
+                time.sleep(settle_time)
+                final_state = self.get_state()
+        final_err = self._tcp_position_error_m(final_state, target_pos)
+        if final_err > self.config.max_ee_pos_err_m:
+            raise IKError(
+                f"Cartesian move settled with {final_err:.6f} m position error "
+                f"(limit {self.config.max_ee_pos_err_m:.6f} m)"
+            )
+        return final_state
 
     def _move_joint_targets_smooth(
         self,
@@ -725,12 +839,13 @@ class SoArmMoceController:
             abs(float(target_value) - float(start_state["joint_state"][joint_name]))
             for joint_name, target_value in target_cmd.items()
         )
-        steps = max(1, int(np.ceil(max_change / resolved_step_size)))
+        hz_steps = int(np.ceil(max(0.0, float(duration)) * max(1.0, float(self.config.joint_update_hz))))
+        steps = max(1, int(np.ceil(max_change / resolved_step_size)), hz_steps)
         step_duration = max(0.0, float(duration)) / steps if steps else 0.0
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         state = start_state
         for step_index in range(1, steps + 1):
-            alpha = float(step_index) / float(steps)
+            alpha = self._smooth_fraction(float(step_index) / float(steps))
             waypoint_cmd = {
                 joint_name: float(start_state["joint_state"][joint_name])
                 + (float(target_value) - float(start_state["joint_state"][joint_name])) * alpha
@@ -753,3 +868,13 @@ class SoArmMoceController:
             "dy": float(after_xyz[1] - before_xyz[1]),
             "dz": float(after_xyz[2] - before_xyz[2]),
         }
+
+    @staticmethod
+    def _tcp_position_error_m(state: Dict[str, Any], target_pos: np.ndarray) -> float:
+        current_xyz = np.asarray(state["tcp_pose"]["xyz"], dtype=float)
+        return float(np.linalg.norm(np.asarray(target_pos, dtype=float) - current_xyz))
+
+    @staticmethod
+    def _smooth_fraction(fraction: float) -> float:
+        t = min(1.0, max(0.0, float(fraction)))
+        return t * t * (3.0 - 2.0 * t)
