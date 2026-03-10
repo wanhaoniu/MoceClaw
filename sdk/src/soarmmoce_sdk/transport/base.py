@@ -6,10 +6,11 @@ import numpy as np
 
 
 class TransportBase:
-    """Abstract transport interface."""
+    """Abstract transport interface for 5DOF arm + optional gripper."""
 
-    def __init__(self, dof: int):
+    def __init__(self, dof: int, *, has_gripper: bool = False):
         self.dof = int(dof)
+        self.has_gripper = bool(has_gripper)
 
     def connect(self) -> None:
         raise NotImplementedError
@@ -33,15 +34,6 @@ class TransportBase:
         raise NotImplementedError
 
     def wait_until_stopped(self, timeout: Optional[float] = None) -> bool:
-        """Best-effort wait for motion completion.
-
-        Returns:
-            True when motion is considered complete.
-            False when timeout expires before completion.
-
-        The default implementation is a no-op for transports that cannot
-        introspect motion state yet.
-        """
         return True
 
     def set_gripper(
@@ -53,5 +45,7 @@ class TransportBase:
         raise NotImplementedError("set_gripper is not supported by this transport")
 
     def get_gripper_open_ratio(self) -> Optional[float]:
-        """Return current gripper open ratio in [0, 1], if supported."""
         return None
+
+    def is_gripper_available(self) -> bool:
+        return bool(self.has_gripper)

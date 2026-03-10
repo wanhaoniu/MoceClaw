@@ -11,11 +11,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SDK_SRC = REPO_ROOT / "sdk" / "src"
+if str(SDK_SRC) not in sys.path:
+    sys.path.insert(0, str(SDK_SRC))
+
 from soarmmoce_sdk import Robot
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SDK_SRC = REPO_ROOT / "sdk" / "src"
 DEFAULT_SHARED_STATE = "/tmp/soarmmoce_mock_shared_state.json"
 
 

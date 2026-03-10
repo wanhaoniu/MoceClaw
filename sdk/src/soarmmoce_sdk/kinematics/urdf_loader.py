@@ -32,19 +32,38 @@ class Joint:
 
 
 class RobotModel:
-    def __init__(self, urdf_path: Path, base_link: Optional[str] = None, end_link: Optional[str] = None):
+    def __init__(
+        self,
+        urdf_path: Path,
+        base_link: Optional[str] = None,
+        end_link: Optional[str] = None,
+        joint_name_aliases: Optional[Dict[str, str]] = None,
+        joint_offsets: Optional[Dict[str, float]] = None,
+    ):
         self.urdf_path = Path(urdf_path)
         self.joints: Dict[str, Joint] = {}
         self.links: List[str] = []
         self._child_map: Dict[str, List[Joint]] = {}
         self._parent_map: Dict[str, Joint] = {}
+        self.joint_name_aliases = dict(joint_name_aliases or {})
+        self.urdf_to_joint_name = {v: k for k, v in self.joint_name_aliases.items()}
+        self._joint_offsets_cfg = dict(joint_offsets or {})
 
         self._load_urdf()
         self.base_link, self.end_link, self.chain_joints = self._build_chain(base_link, end_link)
         self.active_joints = [j for j in self.chain_joints if j.jtype in ("revolute", "continuous", "prismatic")]
         self.dof = len(self.active_joints)
-        self.joint_names = [j.name for j in self.active_joints]
-        self.joint_limits = [(j.limit_lower, j.limit_upper) for j in self.active_joints]
+        self.joint_names = [self.urdf_to_joint_name.get(j.name, j.name) for j in self.active_joints]
+        self.urdf_joint_names = [j.name for j in self.active_joints]
+        self.joint_offsets = np.zeros(self.dof, dtype=float)
+        for idx, (joint_name, urdf_name) in enumerate(zip(self.joint_names, self.urdf_joint_names)):
+            raw = self._joint_offsets_cfg.get(joint_name, self._joint_offsets_cfg.get(urdf_name, 0.0))
+            self.joint_offsets[idx] = float(raw)
+        self.urdf_joint_limits = [(j.limit_lower, j.limit_upper) for j in self.active_joints]
+        self.joint_limits = [
+            (float(lo - off), float(hi - off)) for (lo, hi), off in zip(self.urdf_joint_limits, self.joint_offsets)
+        ]
+        self.joint_name_to_index = {name: i for i, name in enumerate(self.joint_names)}
 
     def _load_urdf(self) -> None:
         if not self.urdf_path.exists():
@@ -159,3 +178,14 @@ class RobotModel:
             for j in self._child_map.get(link, []):
                 stack.append((j.child, path + [j]))
         return None
+
+    def resolve_joint_index(self, joint: str | int) -> int:
+        if isinstance(joint, int):
+            idx = int(joint)
+            if idx < 0 or idx >= self.dof:
+                raise IndexError(f"Joint index out of range: {idx}")
+            return idx
+        name = str(joint).strip()
+        if name in self.joint_name_to_index:
+            return self.joint_name_to_index[name]
+        raise KeyError(f"Unknown joint: {name}")

@@ -27,11 +27,15 @@ def success_payload(data: Any) -> dict[str, Any]:
 
 
 def error_payload(exc: Exception) -> dict[str, Any]:
-    return {
+    payload = {
         "ok": False,
         "result": None,
         "error": {"type": exc.__class__.__name__, "message": str(exc)},
     }
+    details = getattr(exc, "details", None)
+    if details is not None:
+        payload["error"]["details"] = to_jsonable(details)
+    return payload
 
 
 def print_success(data: Any) -> None:

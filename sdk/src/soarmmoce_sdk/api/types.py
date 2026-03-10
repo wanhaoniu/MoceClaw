@@ -11,6 +11,7 @@ class JointState:
     q: np.ndarray
     dq: Optional[np.ndarray] = None
     tau: Optional[np.ndarray] = None
+    names: Optional[list[str]] = None
 
 
 @dataclass
@@ -22,6 +23,7 @@ class Pose:
 @dataclass
 class GripperState:
     available: bool
+    installed: bool = True
     open_ratio: Optional[float] = None
     moving: Optional[bool] = None
 
@@ -35,6 +37,14 @@ class PermissionState:
 
 
 @dataclass
+class TwinState:
+    source: str
+    joint_state: JointState
+    tcp_pose: Pose
+    gripper_state: Optional[GripperState] = None
+
+
+@dataclass
 class RobotState:
     connected: bool
     joint_state: JointState
@@ -42,3 +52,5 @@ class RobotState:
     gripper_state: Optional[GripperState] = None
     permissions: Optional[PermissionState] = None
     timestamp: Optional[float] = None
+    actual: Optional[TwinState] = None
+    twin: Optional[TwinState] = None

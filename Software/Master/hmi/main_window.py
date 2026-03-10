@@ -151,6 +151,7 @@ class ArmControlGUI(QMainWindow):
     log_signal = pyqtSignal(str, str)
     sdk_command_state_ready = pyqtSignal(object, str)
     sdk_command_failed = pyqtSignal(str, str)
+    sdk_sync_state_ready = pyqtSignal(object)
 
     PAGE_QUICK_MOVE = 0
     PAGE_JOB = 1
@@ -193,6 +194,8 @@ class ArmControlGUI(QMainWindow):
         self.sim_robot = None
         self.sim_joint_names = []
         self.sim_q = np.zeros(0, dtype=float)
+        self._sim_joint_offsets = np.zeros(0, dtype=float)
+        self._sim_model_limits = []
         self._sim_fk = None
         self._sim_matrix_to_rpy = None
         self._sim_solve_ik = None
@@ -213,10 +216,10 @@ class ArmControlGUI(QMainWindow):
         try:
             self._sdk_gui_sync_interval_sec = max(
                 0.1,
-                float(str(os.getenv("SOARMMOCE_GUI_SYNC_INTERVAL", "0.5")).strip()),
+                float(str(os.getenv("SOARMMOCE_GUI_SYNC_INTERVAL", "0.25")).strip()),
             )
         except Exception:
-            self._sdk_gui_sync_interval_sec = 0.5
+            self._sdk_gui_sync_interval_sec = 0.25
         self._sdk_auto_home_on_start = str(os.getenv("SOARMMOCE_AUTO_HOME_ON_START", "1")).strip().lower() not in (
             "0",
             "false",
@@ -237,6 +240,16 @@ class ArmControlGUI(QMainWindow):
         self._sdk_cmd_cond = threading.Condition()
         self._sdk_cmd_running = True
         self._sdk_cmd_thread: Optional[threading.Thread] = None
+        self._sdk_sync_running = True
+        self._sdk_sync_thread: Optional[threading.Thread] = None
+        self._sim_motion_active = False
+        self._sim_motion_start_q = np.zeros(0, dtype=float)
+        self._sim_motion_target_q = np.zeros(0, dtype=float)
+        self._sim_motion_start_ts = 0.0
+        self._sim_motion_end_ts = 0.0
+        self._sim_motion_timer = QTimer(self)
+        self._sim_motion_timer.setInterval(16)
+        self._sim_motion_timer.timeout.connect(self._on_sim_motion_tick)
         self._jog_hold_timer = QTimer(self)
         self._jog_hold_timer.setInterval(100)
         self._jog_hold_timer.timeout.connect(self._on_quick_jog_hold_tick)
@@ -252,7 +265,9 @@ class ArmControlGUI(QMainWindow):
         self.log_signal.connect(self._append_log)
         self.sdk_command_state_ready.connect(self._on_sdk_command_state_ready)
         self.sdk_command_failed.connect(self._on_sdk_command_failed)
+        self.sdk_sync_state_ready.connect(self._on_sdk_sync_state_ready)
         self._start_sdk_command_worker()
+        self._start_sdk_sync_worker()
 
         self.refresh_positions()
         self.refresh_recordings()
@@ -314,7 +329,7 @@ class ArmControlGUI(QMainWindow):
                 "quick_speed": "速度",
                 "quick_tcp": "末端位姿",
                 "quick_origin": "回原点",
-                "quick_zero": "回零点",
+                "quick_zero": "回 Home",
                 "quick_free": "自由移动",
                 "job_recordings": "录制",
                 "job_positions": "点位",
@@ -343,7 +358,7 @@ class ArmControlGUI(QMainWindow):
                 "btn_play": "▶️ 播放",
                 "btn_connect": "🔗 连接",
                 "btn_disconnect": "❌ 断开",
-                "btn_home": "🏠 回零",
+                "btn_home": "🏠 Home",
                 "sim_loading": "3D 视图加载中...",
                 "sim_not_initialized": "仿真模型未初始化",
                 "sim_urdf_not_found": "URDF 读取失败：未找到可用 URDF 文件",
@@ -352,7 +367,7 @@ class ArmControlGUI(QMainWindow):
                 "sim_fallback_enabled": "已自动切换到 FK 线框回退模式",
                 "sim_pybullet_init_failed": "PyBullet 初始化失败：{error}",
                 "sim_slider_group": "关节角 (rad)",
-                "sim_reset_zero": "重置为 0",
+                "sim_reset_zero": "重置为 Home",
                 "camera_disconnected": "未连接",
                 "fps_default": "FPS: --",
                 "latency_default": "延迟: -- ms",
@@ -368,8 +383,8 @@ class ArmControlGUI(QMainWindow):
                 "msg_jump_prompt": "跳转到 '{name}' 的时间 (秒):",
                 "msg_confirm_delete_pos": "确定要删除位置 '{name}' 吗?",
                 "msg_confirm_delete_rec": "确定要删除录制 '{name}' 吗?",
-                "msg_confirm_home": "确定要回零吗?",
-                "msg_confirm_exit_home": "要在退出前回零吗?",
+                "msg_confirm_home": "确定要回 Home 位吗?",
+                "msg_confirm_exit_home": "要在退出前回 Home 位吗?",
                 "msg_test_conn_placeholder": "连接测试入口预留（可扩展为 ping/握手）",
                 "log_connecting": "正在连接 {ip}:{port}...",
                 "log_connect_success": "连接成功!",
@@ -387,9 +402,9 @@ class ArmControlGUI(QMainWindow):
                 "log_play_done": "播放完成",
                 "log_play_failed": "播放失败",
                 "log_record_deleted": "录制 '{name}' 已删除",
-                "log_home_start": "正在回零...",
-                "log_home_done": "回零完成",
-                "log_home_failed": "回零失败",
+                "log_home_start": "正在回 Home 位...",
+                "log_home_done": "回 Home 位完成",
+                "log_home_failed": "回 Home 位失败",
                 "rec_item_fmt": "{name} ({frames} 帧, {duration:.1f}s)",
             },
             "en": {
@@ -442,7 +457,7 @@ class ArmControlGUI(QMainWindow):
                 "quick_speed": "Speed",
                 "quick_tcp": "TCP",
                 "quick_origin": "Origin",
-                "quick_zero": "Zero",
+                "quick_zero": "Home",
                 "quick_free": "Free Move",
                 "job_recordings": "Recordings",
                 "job_positions": "Positions",
@@ -480,7 +495,7 @@ class ArmControlGUI(QMainWindow):
                 "sim_fallback_enabled": "Automatically switched to FK wireframe fallback",
                 "sim_pybullet_init_failed": "PyBullet init failed: {error}",
                 "sim_slider_group": "Joint Angles (rad)",
-                "sim_reset_zero": "Reset to 0",
+                "sim_reset_zero": "Reset Home",
                 "camera_disconnected": "Disconnected",
                 "fps_default": "FPS: --",
                 "latency_default": "Latency: -- ms",
@@ -956,6 +971,25 @@ class ArmControlGUI(QMainWindow):
         thread.join(timeout=2.0)
         self._sdk_cmd_thread = None
 
+    def _start_sdk_sync_worker(self):
+        if self._sdk_sync_thread is not None and self._sdk_sync_thread.is_alive():
+            return
+        self._sdk_sync_running = True
+        self._sdk_sync_thread = threading.Thread(
+            target=self._sdk_sync_loop,
+            name="soarmmoce-sdk-sync-worker",
+            daemon=True,
+        )
+        self._sdk_sync_thread.start()
+
+    def _stop_sdk_sync_worker(self):
+        thread = self._sdk_sync_thread
+        if thread is None:
+            return
+        self._sdk_sync_running = False
+        thread.join(timeout=2.0)
+        self._sdk_sync_thread = None
+
     def _drop_sdk_commands_locked(self, kinds: Tuple[str, ...]):
         if not kinds:
             return
@@ -995,7 +1029,7 @@ class ArmControlGUI(QMainWindow):
                 self.sdk_command_failed.emit(source, message)
                 continue
 
-            self.sdk_command_state_ready.emit(state, source)
+            self.sdk_command_state_ready.emit({"state": state, "command": command}, source)
 
     def _execute_sdk_command(self, command: Dict[str, Any]) -> object:
         kind = str(command.get("kind", "")).strip()
@@ -1107,13 +1141,19 @@ class ArmControlGUI(QMainWindow):
             return "SDK stop"
         return f"SDK {src}" if src else "SDK"
 
-    def _on_sdk_command_state_ready(self, state: object, source: str):
-        self._sync_sim_from_sdk_state(state)
+    def _on_sdk_command_state_ready(self, payload: object, source: str):
+        if isinstance(payload, dict):
+            state = payload.get("state")
+            command = payload.get("command")
+        else:
+            state = payload
+            command = None
+        self._handle_sim_motion_from_command(state, command, source)
         self._sdk_last_gui_sync_ts = time.time()
         src = str(source or "").strip()
         if src.startswith("home:"):
-            self.statusBar().showMessage("Robot moved to zero")
-            self.log(f"[{self._sdk_command_label(src)}] moved to zero", "success")
+            self.statusBar().showMessage("Robot moved to home")
+            self.log(f"[{self._sdk_command_label(src)}] moved to home", "success")
         elif src == "stop":
             self.statusBar().showMessage("Robot stopped")
 
@@ -1122,6 +1162,13 @@ class ArmControlGUI(QMainWindow):
         msg = str(message or "").strip() or "Command failed"
         self.statusBar().showMessage(f"{label} failed: {msg}")
         self.log(f"[{label}] {msg}", "warning")
+
+    def _on_sdk_sync_state_ready(self, state: object):
+        if self._sim_motion_active:
+            return
+        self._sync_sim_from_sdk_state(state)
+        self._sdk_last_gui_sync_ts = time.time()
+        self._update_quick_pose_from_sim()
 
     def _on_quick_joint_step(self, idx: int, direction: float):
         if idx < 0:
@@ -1258,7 +1305,11 @@ class ArmControlGUI(QMainWindow):
         lower = [float(lo) for lo, _ in limits]
         upper = [float(hi) for _, hi in limits]
         ranges = [max(1e-4, float(hi - lo)) for lo, hi in limits]
-        rest = [float(self.sim_q[i]) if i < len(self.sim_q) else 0.0 for i in range(len(joint_indices))]
+        rest_user = np.array(
+            [float(self.sim_q[i]) if i < len(self.sim_q) else 0.0 for i in range(len(joint_indices))],
+            dtype=float,
+        )
+        rest = self._sim_user_to_model_q(rest_user).tolist()
         target_quat = _pb.getQuaternionFromEuler([float(target_rpy[0]), float(target_rpy[1]), float(target_rpy[2])])
 
         try:
@@ -1289,7 +1340,10 @@ class ArmControlGUI(QMainWindow):
                 raw = float(q_out[i])
             lo, hi = limits[i]
             q_out[i] = float(np.clip(raw, float(lo), float(hi)))
-        return q_out
+        q_user = self._sim_model_to_user_q(q_out)
+        for i, (lo, hi) in enumerate(self._sim_limits[: q_user.shape[0]]):
+            q_user[i] = float(np.clip(q_user[i], float(lo), float(hi)))
+        return q_user
 
     def _solve_sim_ik(self, target_xyz: np.ndarray, target_rpy: np.ndarray) -> Optional[np.ndarray]:
         if self._sim_backend == "pybullet":
@@ -1303,7 +1357,7 @@ class ArmControlGUI(QMainWindow):
                 self._sim_pb_client,
                 self._sim_pb_robot_id,
                 self._sim_pb_joint_indices,
-                self._sim_limits,
+                self._sim_model_limits or self._sim_limits,
                 ee_idx,
                 target_xyz,
                 target_rpy,
@@ -1324,7 +1378,7 @@ class ArmControlGUI(QMainWindow):
                 int(client_id),
                 int(robot_id),
                 joint_indices,
-                limits,
+                self._sim_model_limits or limits,
                 ee_idx,
                 target_xyz,
                 target_rpy,
@@ -1411,8 +1465,8 @@ class ArmControlGUI(QMainWindow):
             state_after = robot.get_state()
             self._sync_sim_from_sdk_state(state_after)
             self._sdk_last_gui_sync_ts = time.time()
-            self.statusBar().showMessage("Robot moved to zero")
-            self.log(f"[SDK {source}] moved to zero", "success")
+            self.statusBar().showMessage("Robot moved to home")
+            self.log(f"[SDK {source}] moved to home", "success")
             return True
         except Exception as exc:
             self.statusBar().showMessage(f"Home failed: {exc}")
@@ -1436,7 +1490,7 @@ class ArmControlGUI(QMainWindow):
         if self._sdk_auto_home_done:
             return
         self._sdk_auto_home_done = True
-        self._sdk_home_and_sync(duration=self._sdk_auto_home_duration_sec, source="startup")
+        self._enqueue_sdk_home(duration=self._sdk_auto_home_duration_sec, source="startup")
 
     def _on_quick_origin(self):
         self._enqueue_sdk_home(source="origin")
@@ -1781,24 +1835,206 @@ class ArmControlGUI(QMainWindow):
             except Exception:
                 pass
 
-    def _sync_sim_from_sdk_state(self, state: object):
-        if not self._sim_ready:
-            return
+    def _resolve_sim_home_q(self) -> Optional[np.ndarray]:
+        if not SDK_AVAILABLE or RuntimeRobot is None or not self.sim_joint_names:
+            return None
         try:
-            q_src = np.asarray(getattr(getattr(state, "joint_state"), "q"), dtype=float).reshape(-1)
+            robot = RuntimeRobot.from_config(self._sdk_config_path) if self._sdk_config_path else RuntimeRobot()
+            q_sdk = np.asarray(robot._resolve_home_q(), dtype=float).reshape(-1)  # type: ignore[attr-defined]
+            sdk_joint_names = list(getattr(robot.robot_model, "joint_names", []) or [])
+            if q_sdk.shape[0] == 0 or not sdk_joint_names:
+                return None
+            robot_cfg = robot.config.get("robot", {}) if isinstance(robot.config, dict) else {}
+            alias_cfg = robot_cfg.get("joint_name_aliases", {}) if isinstance(robot_cfg, dict) else {}
+            q_sim = np.zeros(len(self.sim_joint_names), dtype=float)
+            for sim_idx, sim_name in enumerate(self.sim_joint_names):
+                sdk_idx = self._sdk_find_joint_index(sdk_joint_names, sim_name)
+                if sdk_idx is None and isinstance(alias_cfg, dict):
+                    sim_key = str(sim_name).strip().lower()
+                    for candidate_idx, sdk_name in enumerate(sdk_joint_names):
+                        alias_name = alias_cfg.get(sdk_name, sdk_name)
+                        alias_key = str(alias_name).strip().lower()
+                        if sim_key == alias_key or sim_key in alias_key or alias_key in sim_key:
+                            sdk_idx = candidate_idx
+                            break
+                if sdk_idx is not None and sdk_idx < q_sdk.shape[0]:
+                    q_sim[sim_idx] = float(q_sdk[sdk_idx])
+                elif sim_idx < len(self.sim_q):
+                    q_sim[sim_idx] = float(self.sim_q[sim_idx])
+            for idx, (lo, hi) in enumerate(self._sim_limits[: q_sim.shape[0]]):
+                q_sim[idx] = float(np.clip(q_sim[idx], float(lo), float(hi)))
+            return q_sim
         except Exception:
-            return
-        if q_src.shape[0] == 0 or len(self.sim_q) == 0:
-            return
+            return None
 
+    def _resolve_sim_joint_offsets(self, joint_names: List[str]) -> np.ndarray:
+        offsets = np.zeros(len(joint_names), dtype=float)
+        if not SDK_AVAILABLE or RuntimeRobot is None or not joint_names:
+            return offsets
+        try:
+            robot = RuntimeRobot.from_config(self._sdk_config_path) if self._sdk_config_path else RuntimeRobot()
+            robot_cfg = robot.config.get("robot", {}) if isinstance(robot.config, dict) else {}
+            alias_cfg = robot_cfg.get("joint_name_aliases", {}) if isinstance(robot_cfg, dict) else {}
+            raw_deg = robot_cfg.get("sim_joint_offsets_deg") or {}
+            raw_rad = robot_cfg.get("sim_joint_offsets") or robot_cfg.get("sim_joint_offsets_rad") or {}
+            for sim_idx, sim_name in enumerate(joint_names):
+                sim_key = str(sim_name).strip()
+                if isinstance(raw_rad, dict) and sim_key in raw_rad:
+                    offsets[sim_idx] = float(raw_rad[sim_key])
+                    continue
+                if isinstance(raw_deg, dict) and sim_key in raw_deg:
+                    offsets[sim_idx] = float(np.deg2rad(float(raw_deg[sim_key])))
+                    continue
+                if isinstance(alias_cfg, dict):
+                    sim_key_norm = sim_key.lower()
+                    for logical_name, urdf_name in alias_cfg.items():
+                        urdf_key = str(urdf_name).strip().lower()
+                        logical_key = str(logical_name).strip()
+                        if sim_key_norm != urdf_key:
+                            continue
+                        if isinstance(raw_rad, dict) and logical_key in raw_rad:
+                            offsets[sim_idx] = float(raw_rad[logical_key])
+                        elif isinstance(raw_deg, dict) and logical_key in raw_deg:
+                            offsets[sim_idx] = float(np.deg2rad(float(raw_deg[logical_key])))
+                        break
+        except Exception:
+            pass
+        return offsets
+
+    def _sim_limits_from_model_limits(self, model_limits: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        for idx, (lo, hi) in enumerate(model_limits):
+            off = float(self._sim_joint_offsets[idx]) if idx < len(self._sim_joint_offsets) else 0.0
+            out.append((float(lo - off), float(hi - off)))
+        return out
+
+    def _sim_user_to_model_q(self, q_src: np.ndarray) -> np.ndarray:
+        q_user = np.asarray(q_src, dtype=float).reshape(-1)
+        q_model = q_user.copy()
+        n = min(q_model.shape[0], len(self._sim_joint_offsets))
+        if n > 0:
+            q_model[:n] = q_model[:n] + self._sim_joint_offsets[:n]
+        return q_model
+
+    def _sim_model_to_user_q(self, q_src: np.ndarray) -> np.ndarray:
+        q_model = np.asarray(q_src, dtype=float).reshape(-1)
+        q_user = q_model.copy()
+        n = min(q_user.shape[0], len(self._sim_joint_offsets))
+        if n > 0:
+            q_user[:n] = q_user[:n] - self._sim_joint_offsets[:n]
+        return q_user
+
+    @staticmethod
+    def _smooth_fraction(fraction: float) -> float:
+        t = min(1.0, max(0.0, float(fraction)))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _extract_joint_q_from_sdk_state(self, state: object, *, prefer_twin: bool = False) -> Optional[np.ndarray]:
+        candidates = []
+        if prefer_twin:
+            candidates.append(getattr(state, "twin", None))
+        candidates.append(state)
+        if not prefer_twin:
+            candidates.append(getattr(state, "twin", None))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                q = np.asarray(getattr(getattr(candidate, "joint_state"), "q"), dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if q.shape[0] > 0:
+                return q
+        return None
+
+    def _apply_sim_joint_q(self, q_src: np.ndarray, *, update_plot: bool = True) -> bool:
+        if not self._sim_ready:
+            return False
+        q = np.asarray(q_src, dtype=float).reshape(-1)
+        if q.shape[0] == 0 or len(self.sim_q) == 0:
+            return False
         q_dst = np.asarray(self.sim_q, dtype=float).copy()
-        n = min(q_dst.shape[0], q_src.shape[0])
-        q_dst[:n] = q_src[:n]
+        n = min(q_dst.shape[0], q.shape[0])
+        q_dst[:n] = q[:n]
         for i in range(min(n, len(self._sim_limits))):
             lo, hi = self._sim_limits[i]
             q_dst[i] = float(np.clip(q_dst[i], float(lo), float(hi)))
         self.sim_q = q_dst
-        self._update_sim_plot()
+        if update_plot:
+            self._update_sim_plot()
+        return True
+
+    def _cancel_sim_motion(self):
+        self._sim_motion_active = False
+        self._sim_motion_start_q = np.zeros(0, dtype=float)
+        self._sim_motion_target_q = np.zeros(0, dtype=float)
+        self._sim_motion_start_ts = 0.0
+        self._sim_motion_end_ts = 0.0
+        self._sim_motion_timer.stop()
+
+    def _schedule_sim_motion(self, target_q: np.ndarray, duration: float):
+        q_target_raw = np.asarray(target_q, dtype=float).reshape(-1)
+        if not self._apply_sim_joint_q(np.asarray(self.sim_q, dtype=float), update_plot=False):
+            return
+        if q_target_raw.shape[0] == 0:
+            return
+        q_start = np.asarray(self.sim_q, dtype=float).copy()
+        q_target = q_start.copy()
+        n = min(q_target.shape[0], q_target_raw.shape[0])
+        q_target[:n] = q_target_raw[:n]
+        for i in range(min(n, len(self._sim_limits))):
+            lo, hi = self._sim_limits[i]
+            q_target[i] = float(np.clip(q_target[i], float(lo), float(hi)))
+        duration = max(0.0, float(duration))
+        if duration <= 1e-4:
+            self._cancel_sim_motion()
+            self._apply_sim_joint_q(q_target, update_plot=True)
+            return
+        self._sim_motion_start_q = q_start
+        self._sim_motion_target_q = q_target.copy()
+        self._sim_motion_start_ts = time.time()
+        self._sim_motion_end_ts = self._sim_motion_start_ts + duration
+        self._sim_motion_active = True
+        if not self._sim_motion_timer.isActive():
+            self._sim_motion_timer.start()
+
+    def _on_sim_motion_tick(self):
+        if not self._sim_motion_active:
+            self._sim_motion_timer.stop()
+            return
+        now = time.time()
+        if now >= self._sim_motion_end_ts or self._sim_motion_end_ts <= self._sim_motion_start_ts:
+            target = self._sim_motion_target_q.copy()
+            self._cancel_sim_motion()
+            self._apply_sim_joint_q(target, update_plot=True)
+            return
+        span = max(1e-9, self._sim_motion_end_ts - self._sim_motion_start_ts)
+        alpha = self._smooth_fraction((now - self._sim_motion_start_ts) / span)
+        q_now = self._sim_motion_start_q + (self._sim_motion_target_q - self._sim_motion_start_q) * alpha
+        self._apply_sim_joint_q(q_now, update_plot=True)
+
+    def _handle_sim_motion_from_command(self, state: object, command: object, source: str):
+        src = str(source or "").strip()
+        if src == "stop":
+            self._cancel_sim_motion()
+            self._sync_sim_from_sdk_state(state)
+            return
+        command_dict = command if isinstance(command, dict) else {}
+        try:
+            duration = float(command_dict.get("duration", 0.0))
+        except Exception:
+            duration = 0.0
+        q_target = self._extract_joint_q_from_sdk_state(state, prefer_twin=True)
+        if q_target is None:
+            self._sync_sim_from_sdk_state(state)
+            return
+        self._schedule_sim_motion(q_target, duration)
+
+    def _sync_sim_from_sdk_state(self, state: object):
+        q_src = self._extract_joint_q_from_sdk_state(state, prefer_twin=False)
+        if q_src is None:
+            return
+        self._apply_sim_joint_q(q_src, update_plot=True)
 
     def _sync_gui_from_sdk(self, force: bool = False) -> bool:
         if not self._sim_ready or not self._sdk_gui_sync_enabled:
@@ -1826,6 +2062,32 @@ class ArmControlGUI(QMainWindow):
         self._sync_sim_from_sdk_state(state)
         self._sdk_last_gui_sync_ts = now
         return True
+
+    def _sdk_sync_loop(self):
+        idle_sleep = 0.05
+        while self._sdk_sync_running:
+            if (not self._sdk_gui_sync_enabled) or (not self._sim_ready) or (self.connected and self.client) or self._sim_motion_active:
+                time.sleep(idle_sleep)
+                continue
+            if not self._sdk_lock.acquire(blocking=False):
+                time.sleep(min(idle_sleep, self._sdk_gui_sync_interval_sec))
+                continue
+            state = None
+            try:
+                robot = self._sdk_get_robot()
+                state = robot.get_state()
+            except Exception as exc:
+                now = time.time()
+                if now - float(self._sdk_last_gui_sync_err_ts) >= 5.0:
+                    self._sdk_last_gui_sync_err_ts = now
+                    self.log_signal.emit(f"[SDK sync] {exc}", "warning")
+            finally:
+                self._sdk_lock.release()
+            if state is None:
+                time.sleep(self._sdk_gui_sync_interval_sec)
+                continue
+            self.sdk_sync_state_ready.emit(state)
+            time.sleep(self._sdk_gui_sync_interval_sec)
 
     def _tool_find_joint_index(self, joint_name: str) -> Optional[int]:
         key = str(joint_name or "").strip().lower()
@@ -2782,8 +3044,7 @@ class ArmControlGUI(QMainWindow):
         if not self.connected or not self.client:
             self.last_rtt_text = "--"
             if self._sim_ready:
-                if not self._sync_gui_from_sdk():
-                    self._update_quick_pose_from_sim()
+                self._update_quick_pose_from_sim()
         else:
             buf = list(self.client.rtt_ms_buf)
             if buf:
@@ -2883,8 +3144,21 @@ class ArmControlGUI(QMainWindow):
             self._sim_pb_renderer_fallback_done = False
             self._sim_backend = "pybullet"
             self.sim_joint_names = joint_names
-            self._sim_limits = limits
-            self.sim_q = np.array(q_init, dtype=float)
+            self._sim_joint_offsets = self._resolve_sim_joint_offsets(self.sim_joint_names)
+            self._sim_model_limits = list(limits)
+            self._sim_limits = self._sim_limits_from_model_limits(self._sim_model_limits)
+            self.sim_q = np.zeros(len(self.sim_joint_names), dtype=float)
+            home_q = self._resolve_sim_home_q()
+            if home_q is not None:
+                self.sim_q = np.asarray(home_q, dtype=float)
+            model_q = self._sim_user_to_model_q(self.sim_q)
+            for idx, joint_idx in enumerate(joint_indices[: model_q.shape[0]]):
+                _pb.resetJointState(
+                    robot_id,
+                    joint_idx,
+                    float(model_q[idx]),
+                    physicsClientId=client_id,
+                )
             self.sim_info_label.setText(self._tr("sim_urdf_loaded"))
         except Exception:
             try:
@@ -2935,8 +3209,13 @@ class ArmControlGUI(QMainWindow):
 
                 self._sim_backend = "vtk"
                 self.sim_joint_names = list(self.sim_vtk_view.joint_names)
-                self._sim_limits = list(self.sim_vtk_view.joint_limits)
-                self.sim_q = np.array(self.sim_vtk_view.joint_values, dtype=float)
+                self._sim_joint_offsets = self._resolve_sim_joint_offsets(self.sim_joint_names)
+                self._sim_model_limits = list(self.sim_vtk_view.joint_limits)
+                self._sim_limits = self._sim_limits_from_model_limits(self._sim_model_limits)
+                self.sim_q = np.zeros(len(self.sim_joint_names), dtype=float)
+                home_q = self._resolve_sim_home_q()
+                if home_q is not None:
+                    self.sim_q = np.asarray(home_q, dtype=float)
                 self._sim_ready = True
 
                 self.sim_info_label.clear()
@@ -3003,7 +3282,16 @@ class ArmControlGUI(QMainWindow):
                     lo, hi = -math.pi, math.pi
                 self.sim_joint_names.append(joint.name)
                 self._sim_limits.append((lo, hi))
+            self._sim_joint_offsets = self._resolve_sim_joint_offsets(self.sim_joint_names)
+            self._sim_model_limits = list(self._sim_limits)
+            self.sim_robot.urdf_joint_limits = list(self._sim_model_limits)
+            self.sim_robot.joint_offsets = np.asarray(self._sim_joint_offsets, dtype=float).copy()
+            self._sim_limits = self._sim_limits_from_model_limits(self._sim_model_limits)
+            self.sim_robot.joint_limits = list(self._sim_limits)
             self.sim_q = np.zeros(len(self.sim_joint_names), dtype=float)
+            home_q = self._resolve_sim_home_q()
+            if home_q is not None:
+                self.sim_q = np.asarray(home_q, dtype=float)
             message = self._tr("sim_fallback_enabled")
             if pybullet_err is not None:
                 message += "\n" + self._tr("sim_pybullet_init_failed", error=pybullet_err)
@@ -3090,15 +3378,22 @@ class ArmControlGUI(QMainWindow):
     def _on_sim_reset(self):
         if not self._sim_ready:
             return
+        home_q = self._resolve_sim_home_q()
         if self._sim_backend == "vtk" and self.sim_vtk_view is not None:
-            self.sim_vtk_view.reset_zero()
-            self.sim_q = np.array(self.sim_vtk_view.joint_values, dtype=float)
+            if home_q is not None:
+                self.sim_q = np.asarray(home_q, dtype=float)
+            else:
+                self.sim_q = np.zeros(len(self.sim_q), dtype=float)
+            self._update_sim_plot()
             self._sync_quick_joint_panel()
             if not self.connected:
                 self._update_quick_pose_from_sim()
             return
         self._sim_updating = True
-        self.sim_q = np.zeros(len(self.sim_q), dtype=float)
+        if home_q is not None:
+            self.sim_q = np.asarray(home_q, dtype=float)
+        else:
+            self.sim_q = np.zeros(len(self.sim_q), dtype=float)
         for i, (lo, hi) in enumerate(self._sim_limits):
             self.sim_q[i] = float(np.clip(self.sim_q[i], lo, hi))
             self.sim_sliders[i].setValue(self._sim_value_to_slider(i, self.sim_q[i]))
@@ -3114,10 +3409,12 @@ class ArmControlGUI(QMainWindow):
         for joint in self.sim_robot.chain_joints:
             T = T @ self._sim_tf_origin(joint.origin_xyz, joint.origin_rpy)
             if joint.jtype in ("revolute", "continuous"):
-                T = T @ self._sim_tf_rot(joint.axis, float(q[qi]))
+                q_model = float(q[qi]) + float(self._sim_joint_offsets[qi]) if qi < len(self._sim_joint_offsets) else float(q[qi])
+                T = T @ self._sim_tf_rot(joint.axis, q_model)
                 qi += 1
             elif joint.jtype == "prismatic":
-                T = T @ self._sim_tf_trans(joint.axis * float(q[qi]))
+                q_model = float(q[qi]) + float(self._sim_joint_offsets[qi]) if qi < len(self._sim_joint_offsets) else float(q[qi])
+                T = T @ self._sim_tf_trans(joint.axis * q_model)
                 qi += 1
             positions.append(T[:3, 3].copy())
         return np.array(positions, dtype=float)
@@ -3139,11 +3436,12 @@ class ArmControlGUI(QMainWindow):
         if self._sim_pb_client is None or self._sim_pb_robot_id is None:
             return
 
+        model_q = self._sim_user_to_model_q(np.asarray(self.sim_q, dtype=float))
         for i, joint_idx in enumerate(self._sim_pb_joint_indices):
             _pb.resetJointState(
                 self._sim_pb_robot_id,
                 joint_idx,
-                float(self.sim_q[i]),
+                float(model_q[i]),
                 physicsClientId=self._sim_pb_client,
             )
 
@@ -3245,6 +3543,8 @@ class ArmControlGUI(QMainWindow):
         self._sim_pb_ee_link_index = None
         self._sim_pb_renderer = None
         self._sim_pb_renderer_fallback_done = False
+        self._sim_joint_offsets = np.zeros(0, dtype=float)
+        self._sim_model_limits = []
         self._sim_fk = None
         self._sim_matrix_to_rpy = None
         self._sim_solve_ik = None
@@ -3253,8 +3553,9 @@ class ArmControlGUI(QMainWindow):
         if not self._sim_ready:
             return
         if self._sim_backend == "vtk" and self.sim_vtk_view is not None:
-            self.sim_vtk_view.set_joint_values(self.sim_q.tolist())
-            self.sim_q = np.array(self.sim_vtk_view.joint_values, dtype=float)
+            model_q = self._sim_user_to_model_q(np.asarray(self.sim_q, dtype=float))
+            self.sim_vtk_view.set_joint_values(model_q.tolist())
+            self.sim_q = self._sim_model_to_user_q(np.array(self.sim_vtk_view.joint_values, dtype=float))
             self._sync_quick_joint_panel()
             if not self.connected:
                 self._update_quick_pose_from_sim()
@@ -3325,6 +3626,7 @@ class ArmControlGUI(QMainWindow):
 
         self._on_quick_jog_released(enqueue_stop=False)
         self._stop_sdk_command_worker()
+        self._stop_sdk_sync_worker()
         self._sdk_disconnect_robot()
         self._cleanup_sim_backend()
         event.accept()

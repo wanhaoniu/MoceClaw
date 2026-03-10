@@ -626,7 +626,7 @@ class SpeechInputWindow(QWidget):
         self._stt_worker: Optional[_GroqSttWorker] = None
         self._openclaw_worker: Optional[_OpenClawAgentWorker] = None
 
-        self._groq_api_key = os.getenv("GROQ_API_KEY", GROQ_API_KEY_FALLBACK).strip()
+        self._groq_api_key = str(os.getenv("GROQ_API_KEY") or GROQ_API_KEY_FALLBACK or "").strip()
         self._groq_stt_url = os.getenv("GROQ_STT_URL", GROQ_STT_URL_DEFAULT).strip()
         self._groq_stt_model = os.getenv("GROQ_STT_MODEL", GROQ_STT_MODEL_DEFAULT).strip()
 

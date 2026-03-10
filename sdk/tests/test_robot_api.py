@@ -20,11 +20,17 @@ def test_get_state_default_config():
     assert state.permissions is not None
     assert state.permissions.allow_motion is True
     assert isinstance(state.timestamp, float)
+    assert state.actual is not None
+    assert state.actual.source == "mock"
+    assert state.twin is not None
+    assert state.twin.source == "kinematic_twin"
+    assert np.allclose(state.actual.joint_state.q, state.joint_state.q)
+    assert np.allclose(state.twin.joint_state.q, state.joint_state.q)
 
     robot.disconnect()
 
 
-def test_home_uses_zero_fallback():
+def test_home_uses_configured_pose():
     robot = Robot()
     robot.connect()
 
@@ -34,7 +40,13 @@ def test_home_uses_zero_fallback():
     robot.move_joints(q_mid, duration=0.01)
 
     q_home = robot.home(duration=0.01)
-    assert np.allclose(q_home, np.zeros(robot.robot_model.dof))
+    expected = np.deg2rad(
+        np.array(
+            [2.32967032967033, 0.0, 0.0, 74.98901098901099, 6.945054945054945],
+            dtype=float,
+        )
+    )
+    assert np.allclose(q_home, expected)
     assert np.allclose(robot.get_joint_state().q, q_home)
 
     robot.disconnect()
@@ -56,6 +68,48 @@ def test_move_tcp_keeps_orientation_when_rpy_none():
 
     after = robot.get_end_effector_pose()
     assert np.allclose(after.rpy, current.rpy, atol=1e-2)
+
+    robot.disconnect()
+
+
+def test_move_pose_pure_ry_rotation_changes_end_effector_pitch():
+    robot = Robot()
+    robot.connect()
+
+    current = robot.get_end_effector_pose()
+    target_rpy = current.rpy + np.array([0.0, 0.08, 0.0], dtype=float)
+    robot.move_pose(
+        xyz=current.xyz,
+        rpy=target_rpy,
+        duration=0.01,
+        wait=True,
+        timeout=0.2,
+    )
+
+    after = robot.get_end_effector_pose()
+    delta = after.rpy - current.rpy
+    assert delta[1] > 0.05
+
+    robot.disconnect()
+
+
+def test_move_pose_pure_rz_rotation_changes_end_effector_yaw():
+    robot = Robot()
+    robot.connect()
+
+    current = robot.get_end_effector_pose()
+    target_rpy = current.rpy + np.array([0.0, 0.0, 0.08], dtype=float)
+    robot.move_pose(
+        xyz=current.xyz,
+        rpy=target_rpy,
+        duration=0.01,
+        wait=True,
+        timeout=0.2,
+    )
+
+    after = robot.get_end_effector_pose()
+    delta = after.rpy - current.rpy
+    assert delta[2] > 0.05
 
     robot.disconnect()
 
@@ -119,5 +173,29 @@ def test_rotate_joint_changes_one_joint():
 
     assert q1.shape == q0.shape
     assert q1[idx] != pytest.approx(q0[idx])
+
+    robot.disconnect()
+
+
+def test_twin_tracks_command_target_during_motion():
+    robot = Robot()
+    robot.connect()
+
+    q0 = robot.get_joint_state().q.copy()
+    q1 = q0.copy()
+    q1[-1] = q1[-1] + np.deg2rad(8.0)
+
+    robot.move_joints(q1, duration=0.3, wait=False)
+    state = robot.get_state()
+
+    assert state.actual is not None
+    assert state.twin is not None
+    assert np.allclose(state.twin.joint_state.q, q1)
+    assert not np.allclose(state.actual.joint_state.q, q1, atol=1e-4)
+
+    robot.wait_until_stopped(timeout=1.0)
+    settled = robot.get_state()
+    assert settled.actual is not None
+    assert np.allclose(settled.actual.joint_state.q, q1, atol=1e-4)
 
     robot.disconnect()

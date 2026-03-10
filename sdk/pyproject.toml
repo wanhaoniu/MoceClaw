@@ -20,7 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 sim = ["pybullet>=3.2"]
 viz = []
-hardware = []
+hardware = ["lerobot"]
 dev = ["build", "pytest", "black", "ruff"]
 
 [tool.setuptools]

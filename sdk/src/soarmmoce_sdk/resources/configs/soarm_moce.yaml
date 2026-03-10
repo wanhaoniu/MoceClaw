@@ -4,6 +4,11 @@ transport:
   baudrate: 115200
   host: 192.168.66.130
   timeout: 2.0
+  robot_id: follower_moce
+  calibration_path: ""
+  arm_p_coefficient: 16
+  arm_d_coefficient: 8
+  update_hz: 25.0
 
 urdf:
   path: "pkg://soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf"
@@ -14,9 +19,54 @@ meshes:
 calibration:
   path: ""
 
+robot:
+  base_link: base
+  end_link: wrist_roll
+  joint_name_aliases:
+    shoulder_pan: shoulder
+    shoulder_lift: shoulder_lift
+    elbow_flex: elbow
+    wrist_flex: wrist
+    wrist_roll: wrist_roll
+  joint_scales:
+    shoulder_pan: 1.0
+    shoulder_lift: 5.3
+    elbow_flex: 5.6
+    wrist_flex: 1.0
+    wrist_roll: 1.0
+  sim_joint_offsets_deg:
+    shoulder_lift: -90.0
+    wrist_flex: -180.0
+  multi_turn_joints: [shoulder_lift, elbow_flex]
+  cartesian_locked_joints: [wrist_roll]
+  gui_rotvec_to_joint:
+    wrist_roll: [0.0, 0.0, 1.0]
+
 control:
-  hz: 100
+  hz: 25.0
   timeout: 2.0
+
+ik:
+  max_iters: 200
+  damping: 0.05
+  step_scale: 0.8
+  pos_tol: 0.001
+  rot_tol: 0.02
+  orientation_weight: 0.35
+  orientation_only_weight: 1.0
+  orientation_only_position_weight: 0.0
+  orientation_only_pos_threshold_m: 0.000001
+  max_step_rad: 0.15
+  seed_bias: 0.02
+  max_pos_error_m: 0.03
+
+home:
+  joints_deg:
+    shoulder_pan: 2.32967032967033
+    shoulder_lift: 0.0
+    elbow_flex: 0.0
+    wrist_flex: 74.98901098901099
+    wrist_roll: 6.945054945054945
 
 permissions:
   allow_motion: true
@@ -29,9 +79,8 @@ protocol:
   max_retries: 1
   use_seq: false
   sdk_to_server_map:
-    shoulder: shoulder_pan
+    shoulder_pan: shoulder_pan
     shoulder_lift: shoulder_lift
-    elbow: elbow_flex
-    wrist: wrist_flex
+    elbow_flex: elbow_flex
+    wrist_flex: wrist_flex
     wrist_roll: wrist_roll
-    gripper: gripper

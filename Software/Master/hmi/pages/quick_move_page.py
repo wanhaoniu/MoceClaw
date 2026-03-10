@@ -172,7 +172,7 @@ class QuickMovePage(QWidget):
 
         bottom = QHBoxLayout()
         self.goto_origin_btn = QPushButton("Origin")
-        self.goto_zero_btn = QPushButton("Zero")
+        self.goto_zero_btn = QPushButton("Home")
         self.free_move_btn = QPushButton("Free Move")
         self.status_light = QLabel("●")
         self.status_light.setStyleSheet("color:#10B981; font-size:16px;")

@@ -18,10 +18,12 @@ def fk(robot: RobotModel, q: np.ndarray) -> np.ndarray:
     for j in robot.chain_joints:
         T = T @ transform_from_xyz_rpy(j.origin_xyz, j.origin_rpy)
         if j.jtype in ("revolute", "continuous"):
-            T = T @ transform_rot(j.axis, float(q[qi]))
+            q_model = float(q[qi]) + float(robot.joint_offsets[qi])
+            T = T @ transform_rot(j.axis, q_model)
             qi += 1
         elif j.jtype == "prismatic":
-            T = T @ transform_trans(j.axis * float(q[qi]))
+            q_model = float(q[qi]) + float(robot.joint_offsets[qi])
+            T = T @ transform_trans(j.axis * q_model)
             qi += 1
     return T
 
@@ -42,14 +44,15 @@ def jacobian(robot: RobotModel, q: np.ndarray) -> np.ndarray:
         if j.jtype in ("revolute", "continuous", "prismatic"):
             axis_base = T[:3, :3] @ j.axis
             p_joint = T[:3, 3]
+            q_model = float(q[qi]) + float(robot.joint_offsets[qi])
             if j.jtype in ("revolute", "continuous"):
                 J[:3, col] = np.cross(axis_base, (p_ee - p_joint))
                 J[3:, col] = axis_base
-                T = T @ transform_rot(j.axis, float(q[qi]))
+                T = T @ transform_rot(j.axis, q_model)
             else:
                 J[:3, col] = axis_base
                 J[3:, col] = 0.0
-                T = T @ transform_trans(j.axis * float(q[qi]))
+                T = T @ transform_trans(j.axis * q_model)
             qi += 1
             col += 1
     return J

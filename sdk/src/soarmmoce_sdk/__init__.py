@@ -15,6 +15,7 @@ from .api import (
     RobotState,
     SoarmMoceError,
     TimeoutError,
+    TwinState,
 )
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "GripperState",
     "PermissionState",
     "RobotState",
+    "TwinState",
     "SoarmMoceError",
     "ConnectionError",
     "ProtocolError",

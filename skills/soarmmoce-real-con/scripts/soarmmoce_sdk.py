@@ -34,6 +34,7 @@ MULTI_TURN_JOINTS = ("shoulder_lift", "elbow_flex")
 LOCKED_CARTESIAN_JOINTS = ("wrist_roll",)
 MULTI_TURN_RAW_RANGE = 900000
 RAW_COUNTS_PER_REV = 4096.0
+HALF_RAW_COUNTS_PER_REV = RAW_COUNTS_PER_REV / 2.0
 DEFAULT_TARGET_FRAME = "wrist_roll"
 DEFAULT_HOME_JOINTS = {
     "shoulder_pan": -8.923076923076923,
@@ -72,6 +73,12 @@ class HardwareError(RuntimeError):
 
 class IKError(RuntimeError):
     pass
+
+
+class IKTraceError(IKError):
+    def __init__(self, message: str, *, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,7 @@ def _candidate_calibration_dirs() -> list[Path]:
         candidates.append(Path(env).expanduser())
     candidates.extend(
         [
+            Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower",
             REPO_ROOT / "Software/Slave/calibration/robots/so101_follower",
             REPO_ROOT / "Software/Master/calibration/robots/so101_follower",
             Path.cwd() / "Software/Slave/calibration/robots/so101_follower",
@@ -143,6 +151,37 @@ def _candidate_calibration_dirs() -> list[Path]:
         seen.add(key)
         unique.append(path)
     return unique
+
+
+def _candidate_calibration_robot_ids() -> list[str]:
+    env_robot_id = _env_value("SOARMMOCE_ROBOT_ID")
+    if env_robot_id:
+        return [env_robot_id]
+    candidates = ["soarmmoce", "follower_moce"]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for robot_id in candidates:
+        key = str(robot_id).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    return unique
+
+
+def _resolve_calibration_target() -> tuple[str, Path]:
+    searched: list[str] = []
+    for candidate_dir in _candidate_calibration_dirs():
+        for robot_id in _candidate_calibration_robot_ids():
+            fpath = candidate_dir / f"{robot_id}.json"
+            searched.append(str(fpath))
+            if fpath.exists():
+                return robot_id, candidate_dir.resolve()
+    raise FileNotFoundError(
+        "Could not find calibration file. Searched: "
+        + str(searched)
+        + ". Set SOARMMOCE_CALIB_DIR and/or SOARMMOCE_ROBOT_ID explicitly."
+    )
 
 
 def _candidate_urdf_paths() -> list[Path]:
@@ -224,21 +263,10 @@ def _resolve_joint_scales() -> Dict[str, float]:
 
 
 def resolve_config() -> SoArmMoceConfig:
-    robot_id = _env_value("SOARMMOCE_ROBOT_ID", default="follower_moce")
     port = _env_value("SOARMMOCE_PORT", default="/dev/ttyACM0")
     urdf_path = _resolve_urdf_path()
     target_frame = _env_value("SOARMMOCE_TARGET_FRAME", default=DEFAULT_TARGET_FRAME)
-
-    chosen_dir = None
-    for candidate in _candidate_calibration_dirs():
-        if (candidate / f"{robot_id}.json").exists():
-            chosen_dir = candidate.resolve()
-            break
-    if chosen_dir is None:
-        searched = [str(path) for path in _candidate_calibration_dirs()]
-        raise FileNotFoundError(
-            f"Could not find calibration for {robot_id}. Searched: {searched}. Set SOARMMOCE_CALIB_DIR explicitly."
-        )
+    robot_id, chosen_dir = _resolve_calibration_target()
 
     return SoArmMoceConfig(
         port=port,
@@ -298,6 +326,7 @@ class SoArmMoceController:
         self._lock = threading.Lock()
         self._bus: Optional[FeetechMotorsBus] = None
         self._kin_chain = None
+        self._multi_turn_state: Dict[str, Dict[str, float]] = {}
 
     def __enter__(self) -> "SoArmMoceController":
         return self
@@ -315,6 +344,7 @@ class SoArmMoceController:
             except Exception:
                 pass
         self._bus = None
+        self._multi_turn_state = {}
 
     def meta(self) -> Dict[str, Any]:
         return {
@@ -332,8 +362,7 @@ class SoArmMoceController:
 
     def get_state(self) -> Dict[str, Any]:
         bus = self._ensure_bus()
-        current_motor = bus.sync_read("Present_Position")
-        joints = {name: self._motor_to_joint_deg(name, float(current_motor.get(name, 0.0))) for name in JOINTS}
+        joints = self._read_joint_state_from_bus(bus)
         tf = self._forward_kinematics_from_arm_deg(np.array([joints[name] for name in ARM_JOINTS], dtype=float))
         pose = self._transform_to_pose_dict(tf)
         pose.pop("rot_matrix", None)
@@ -351,6 +380,113 @@ class SoArmMoceController:
     def read(self) -> Dict[str, Any]:
         return {"meta": self.meta(), "state": self.get_state()}
 
+    def diagnose_ik(
+        self,
+        *,
+        dx: float = 0.0,
+        dy: float = 0.0,
+        dz: float = 0.0,
+        frame: str = "base",
+        repeats: int = 12,
+        seed_jitter_deg: float = 0.1,
+        random_seed: int = 0,
+    ) -> Dict[str, Any]:
+        if abs(dx) < 1e-12 and abs(dy) < 1e-12 and abs(dz) < 1e-12:
+            raise ValidationError("At least one of dx/dy/dz must be non-zero")
+        if frame not in {"base", "tool"}:
+            raise ValidationError("frame must be 'base' or 'tool'")
+
+        state = self.get_state()
+        q_seed_deg = self._state_to_arm_q_deg(state)
+        current_tf = self._forward_kinematics_from_arm_deg(q_seed_deg)
+        delta = np.array([float(dx), float(dy), float(dz)], dtype=float)
+        if frame == "tool":
+            target_pos = np.asarray(current_tf.pos, dtype=float) + current_tf.rot_mat @ delta
+        else:
+            target_pos = np.asarray(current_tf.pos, dtype=float) + delta
+
+        locked_joint_targets_deg = {
+            joint_name: float(state["joint_state"][joint_name]) for joint_name in LOCKED_CARTESIAN_JOINTS
+        }
+        locked_indices = [ARM_JOINTS.index(name) for name in LOCKED_CARTESIAN_JOINTS if name in ARM_JOINTS]
+        active_indices = [idx for idx in range(len(ARM_JOINTS)) if idx not in locked_indices]
+
+        jacobian_full = np.asarray(self._ensure_kin_chain().jacobian(np.deg2rad(q_seed_deg)), dtype=float)[:3, :]
+        jacobian_pos = jacobian_full[:, active_indices]
+        singular_values = np.linalg.svd(jacobian_pos, compute_uv=False)
+        min_sv = float(np.min(singular_values)) if singular_values.size else 0.0
+        max_sv = float(np.max(singular_values)) if singular_values.size else 0.0
+        condition_number = float(max_sv / min_sv) if min_sv > 1e-12 else float("inf")
+
+        rng = np.random.default_rng(int(random_seed))
+        solve_runs: list[Dict[str, Any]] = []
+        run_joint_targets: list[np.ndarray] = []
+        run_tcp_deltas: list[np.ndarray] = []
+        requested_repeats = max(1, int(repeats))
+        jitter_deg = max(0.0, float(seed_jitter_deg))
+
+        for run_index in range(requested_repeats):
+            q_trial_deg = q_seed_deg.copy()
+            if run_index > 0 and jitter_deg > 0.0:
+                jitter = rng.uniform(-jitter_deg, jitter_deg, size=len(active_indices))
+                q_trial_deg[active_indices] = q_trial_deg[active_indices] + jitter
+            ik = self._solve_ik_to_position(
+                target_pos,
+                q_trial_deg,
+                locked_joint_targets_deg=locked_joint_targets_deg,
+            )
+            q_target_deg = np.asarray(ik["q_target_deg"], dtype=float)
+            achieved_tf = self._forward_kinematics_from_arm_deg(q_target_deg)
+            achieved_delta = np.asarray(achieved_tf.pos, dtype=float) - np.asarray(current_tf.pos, dtype=float)
+            q_delta_deg = q_target_deg - q_seed_deg
+            run_joint_targets.append(q_target_deg)
+            run_tcp_deltas.append(achieved_delta)
+            solve_runs.append(
+                {
+                    "run_index": run_index,
+                    "seed_deg": {name: float(q_trial_deg[idx]) for idx, name in enumerate(ARM_JOINTS)},
+                    "q_target_deg": {name: float(q_target_deg[idx]) for idx, name in enumerate(ARM_JOINTS)},
+                    "q_delta_deg": {name: float(q_delta_deg[idx]) for idx, name in enumerate(ARM_JOINTS)},
+                    "achieved_tcp_delta": self._xyz_dict(achieved_delta),
+                    "pos_err_m": float(ik["pos_err_m"]),
+                    "iterations": int(ik["iterations"]),
+                }
+            )
+
+        joint_targets_arr = np.vstack(run_joint_targets)
+        tcp_deltas_arr = np.vstack(run_tcp_deltas)
+        return {
+            "note": "read-only IK diagnosis, does not move hardware",
+            "request": {"dx": float(dx), "dy": float(dy), "dz": float(dz), "frame": frame},
+            "state": state,
+            "target_tcp": self._xyz_dict(target_pos),
+            "jacobian": {
+                "locked_joints": list(LOCKED_CARTESIAN_JOINTS),
+                "active_joints": [ARM_JOINTS[idx] for idx in active_indices],
+                "singular_values": [float(value) for value in singular_values],
+                "condition_number": condition_number,
+            },
+            "solver": {
+                "repeats": requested_repeats,
+                "seed_jitter_deg": jitter_deg,
+                "random_seed": int(random_seed),
+            },
+            "summary": {
+                "target_joint_span_deg": {
+                    name: float(np.max(joint_targets_arr[:, idx]) - np.min(joint_targets_arr[:, idx]))
+                    for idx, name in enumerate(ARM_JOINTS)
+                },
+                "achieved_tcp_span_m": {
+                    "x": float(np.max(tcp_deltas_arr[:, 0]) - np.min(tcp_deltas_arr[:, 0])),
+                    "y": float(np.max(tcp_deltas_arr[:, 1]) - np.min(tcp_deltas_arr[:, 1])),
+                    "z": float(np.max(tcp_deltas_arr[:, 2]) - np.min(tcp_deltas_arr[:, 2])),
+                },
+                "best_pos_err_m": float(min(run["pos_err_m"] for run in solve_runs)),
+                "worst_pos_err_m": float(max(run["pos_err_m"] for run in solve_runs)),
+            },
+            "runs": solve_runs,
+        }
+
     def move_to(
         self,
         *,
@@ -360,6 +496,7 @@ class SoArmMoceController:
         duration: float = 1.0,
         wait: bool = True,
         timeout: Optional[float] = None,
+        trace: bool = False,
     ) -> Dict[str, Any]:
         if x is None and y is None and z is None:
             raise ValidationError("At least one of x/y/z is required")
@@ -374,19 +511,24 @@ class SoArmMoceController:
             ],
             dtype=float,
         )
+        trace_steps: Optional[list[Dict[str, Any]]] = [] if trace else None
         state = self._move_tcp_smooth(
             start_state=before,
             target_pos=target_pos,
             duration=duration,
             wait=wait,
             timeout=timeout,
+            trace_steps=trace_steps,
         )
-        return {
+        result = {
             "action": "move_to",
             "target_tcp": self._xyz_dict(target_pos),
             "tcp_delta": self._tcp_delta(before, state),
             "state": state,
         }
+        if trace_steps is not None:
+            result["trace"] = self._finalize_trace(trace_steps)
+        return result
 
     def move_delta(
         self,
@@ -398,6 +540,7 @@ class SoArmMoceController:
         duration: float = 1.0,
         wait: bool = True,
         timeout: Optional[float] = None,
+        trace: bool = False,
     ) -> Dict[str, Any]:
         if abs(dx) < 1e-12 and abs(dy) < 1e-12 and abs(dz) < 1e-12:
             raise ValidationError("At least one of dx/dy/dz must be non-zero")
@@ -412,19 +555,24 @@ class SoArmMoceController:
             target_pos = np.asarray(current_tf.pos, dtype=float) + current_tf.rot_mat @ delta
         else:
             target_pos = np.asarray(current_tf.pos, dtype=float) + delta
+        trace_steps: Optional[list[Dict[str, Any]]] = [] if trace else None
         state = self._move_tcp_smooth(
             start_state=before,
             target_pos=target_pos,
             duration=duration,
             wait=wait,
             timeout=timeout,
+            trace_steps=trace_steps,
         )
-        return {
+        result = {
             "action": "move_delta",
             "requested_delta": {"dx": float(dx), "dy": float(dy), "dz": float(dz), "frame": frame},
             "tcp_delta": self._tcp_delta(before, state),
             "state": state,
         }
+        if trace_steps is not None:
+            result["trace"] = self._finalize_trace(trace_steps)
+        return result
 
     def move_joint(
         self,
@@ -435,6 +583,7 @@ class SoArmMoceController:
         duration: float = 1.0,
         wait: bool = True,
         timeout: Optional[float] = None,
+        trace: bool = False,
     ) -> Dict[str, Any]:
         joint_name = self._validate_joint_name(joint)
         if (delta_deg is None) == (target_deg is None):
@@ -444,20 +593,25 @@ class SoArmMoceController:
         target = float(current + float(delta_deg)) if delta_deg is not None else float(target_deg)
         target_cmd = {name: float(before["joint_state"][name]) for name in JOINTS}
         target_cmd[joint_name] = target
+        trace_steps: Optional[list[Dict[str, Any]]] = [] if trace else None
         state = self._move_joint_targets_smooth(
             start_state=before,
             target_cmd=target_cmd,
             duration=duration,
             wait=wait,
             timeout=timeout,
+            trace_steps=trace_steps,
         )
-        return {
+        result = {
             "action": "move_joint",
             "joint": joint_name,
             "delta_deg": float(target - current),
             "target_deg": target,
             "state": state,
         }
+        if trace_steps is not None:
+            result["trace"] = self._finalize_trace(trace_steps)
+        return result
 
     def move_joints(
         self,
@@ -466,6 +620,7 @@ class SoArmMoceController:
         duration: float = 1.0,
         wait: bool = True,
         timeout: Optional[float] = None,
+        trace: bool = False,
     ) -> Dict[str, Any]:
         if not isinstance(targets_deg, dict) or not targets_deg:
             raise ValidationError("targets_deg must be a non-empty object")
@@ -476,29 +631,46 @@ class SoArmMoceController:
             if not isinstance(raw_value, (int, float)):
                 raise ValidationError(f"targets_deg.{joint} must be a number")
             cmd[joint] = float(raw_value)
+        trace_steps: Optional[list[Dict[str, Any]]] = [] if trace else None
         state = self._move_joint_targets_smooth(
             start_state=before,
             target_cmd=cmd,
             duration=duration,
             wait=wait,
             timeout=timeout,
+            trace_steps=trace_steps,
         )
-        return {
+        result = {
             "action": "move_joints",
             "targets_deg": cmd,
             "state": state,
         }
+        if trace_steps is not None:
+            result["trace"] = self._finalize_trace(trace_steps)
+        return result
 
-    def home(self, *, duration: float = 1.5, wait: bool = True, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def home(
+        self,
+        *,
+        duration: float = 1.5,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+        trace: bool = False,
+    ) -> Dict[str, Any]:
         before = self.get_state()
+        trace_steps: Optional[list[Dict[str, Any]]] = [] if trace else None
         state = self._move_joint_targets_smooth(
             start_state=before,
             target_cmd=dict(self.config.home_joints),
             duration=duration,
             wait=wait,
             timeout=timeout,
+            trace_steps=trace_steps,
         )
-        return {"action": "home", "target_joints": dict(self.config.home_joints), "state": state}
+        result = {"action": "home", "target_joints": dict(self.config.home_joints), "state": state}
+        if trace_steps is not None:
+            result["trace"] = self._finalize_trace(trace_steps)
+        return result
 
     def set_gripper(
         self,
@@ -723,12 +895,76 @@ class SoArmMoceController:
     def _joint_to_motor_deg(self, joint_name: str, joint_deg: float) -> float:
         return float(joint_deg) * self._joint_scale(joint_name)
 
+    def _unwrap_multi_turn_raw(self, joint_name: str, raw_value: float) -> float:
+        raw_scalar = float(raw_value)
+        raw_mod = float(raw_scalar % RAW_COUNTS_PER_REV)
+        state = self._multi_turn_state.get(joint_name)
+        if state is None:
+            continuous_raw = raw_mod
+        else:
+            last_raw_mod = float(state["last_raw_mod"])
+            last_continuous_raw = float(state["continuous_raw"])
+            delta = raw_mod - last_raw_mod
+            if delta > HALF_RAW_COUNTS_PER_REV:
+                delta -= RAW_COUNTS_PER_REV
+            elif delta < -HALF_RAW_COUNTS_PER_REV:
+                delta += RAW_COUNTS_PER_REV
+            continuous_raw = last_continuous_raw + delta
+        self._multi_turn_state[joint_name] = {
+            "last_raw_mod": raw_mod,
+            "continuous_raw": continuous_raw,
+        }
+        return continuous_raw
+
+    def _multi_turn_raw_to_joint_deg(self, joint_name: str, raw_value: float) -> float:
+        continuous_raw = self._unwrap_multi_turn_raw(joint_name, raw_value)
+        motor_deg = continuous_raw * 360.0 / RAW_COUNTS_PER_REV
+        return self._motor_to_joint_deg(joint_name, motor_deg)
+
+    def _snapshot_multi_turn_state(self) -> Dict[str, Dict[str, float]]:
+        return {
+            name: {
+                "last_raw_mod": float(state["last_raw_mod"]),
+                "continuous_raw": float(state["continuous_raw"]),
+                "motor_deg": float(state["continuous_raw"] * 360.0 / RAW_COUNTS_PER_REV),
+                "joint_deg": float(
+                    self._motor_to_joint_deg(name, state["continuous_raw"] * 360.0 / RAW_COUNTS_PER_REV)
+                ),
+            }
+            for name, state in self._multi_turn_state.items()
+        }
+
     def _read_joint_state_from_bus(self, bus: FeetechMotorsBus) -> Dict[str, float]:
+        raw_motor = bus.sync_read("Present_Position", normalize=False)
         current_motor = bus.sync_read("Present_Position")
-        return {name: self._motor_to_joint_deg(name, float(current_motor.get(name, 0.0))) for name in JOINTS}
+        joints: Dict[str, float] = {}
+        for name in JOINTS:
+            if name in MULTI_TURN_JOINTS:
+                joints[name] = self._multi_turn_raw_to_joint_deg(name, float(raw_motor.get(name, 0.0)))
+            else:
+                joints[name] = self._motor_to_joint_deg(name, float(current_motor.get(name, 0.0)))
+        return joints
 
     def _get_current_joint_state(self) -> Dict[str, float]:
         return self._read_joint_state_from_bus(self._ensure_bus())
+
+    @staticmethod
+    def _read_raw_present_position(bus: FeetechMotorsBus) -> Dict[str, int]:
+        raw_motor = bus.sync_read("Present_Position", normalize=False)
+        return {name: int(raw_motor.get(name, 0)) for name in JOINTS}
+
+    @staticmethod
+    def _joint_error_deg(target_joint_deg: Dict[str, float], actual_joint_deg: Dict[str, float]) -> Dict[str, float]:
+        return {
+            name: float(actual_joint_deg[name] - float(target_joint_deg[name]))
+            for name in target_joint_deg
+            if name in actual_joint_deg
+        }
+
+    @staticmethod
+    def _raw_delta(before_raw: Dict[str, int], after_raw: Dict[str, int]) -> Dict[str, int]:
+        keys = list(dict.fromkeys(list(before_raw.keys()) + list(after_raw.keys())))
+        return {name: int(after_raw.get(name, 0) - before_raw.get(name, 0)) for name in keys}
 
     def _build_bus_command(
         self,
@@ -748,14 +984,48 @@ class SoArmMoceController:
                 cmd[name] = self._joint_to_motor_deg(name, float(target))
         return cmd
 
-    def _move_goal(self, cmd: Dict[str, float], *, duration: float, wait: bool, timeout: Optional[float]) -> Dict[str, Any]:
+    def _move_goal(
+        self,
+        cmd: Dict[str, float],
+        *,
+        duration: float,
+        wait: bool,
+        timeout: Optional[float],
+        command_reference_joint_deg: Optional[Dict[str, float]] = None,
+        trace_entry: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         bus = self._ensure_bus()
         current_joint_deg = self._read_joint_state_from_bus(bus)
-        bus_cmd = self._build_bus_command(cmd, current_joint_deg=current_joint_deg)
+        command_reference_joint_deg = dict(command_reference_joint_deg or current_joint_deg)
+        raw_before = self._read_raw_present_position(bus) if trace_entry is not None else None
+        bus_cmd = self._build_bus_command(cmd, current_joint_deg=command_reference_joint_deg)
         if bus_cmd:
             bus.sync_write("Goal_Position", bus_cmd)
         self._wait(duration, wait, timeout)
-        return self.get_state()
+        state = self.get_state()
+        if trace_entry is not None:
+            raw_after = self._read_raw_present_position(bus)
+            trace_entry.update(
+                {
+                    "before_joint_deg": {name: float(current_joint_deg[name]) for name in JOINTS},
+                    "command_reference_joint_deg": {
+                        name: float(command_reference_joint_deg[name]) for name in JOINTS if name in command_reference_joint_deg
+                    },
+                    "after_joint_deg": {name: float(state["joint_state"][name]) for name in JOINTS},
+                    "target_joint_deg": {name: float(cmd[name]) for name in cmd},
+                    "joint_error_deg": self._joint_error_deg(cmd, state["joint_state"]),
+                    "bus_cmd": {name: float(value) for name, value in bus_cmd.items()},
+                    "multi_turn_raw_step_cmd": {
+                        name: int(round(bus_cmd[name])) for name in MULTI_TURN_JOINTS if name in bus_cmd
+                    },
+                    "raw_present_position_before": raw_before,
+                    "raw_present_position_after": raw_after,
+                    "raw_present_position_delta": self._raw_delta(raw_before or {}, raw_after),
+                    "multi_turn_state": self._snapshot_multi_turn_state(),
+                    "wait_s": float(duration),
+                }
+            )
+        return state
 
     def _hold_current_pose(self) -> Dict[str, Any]:
         state = self.get_state()
@@ -773,53 +1043,117 @@ class SoArmMoceController:
         duration: float,
         wait: bool,
         timeout: Optional[float],
+        trace_steps: Optional[list[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         start_xyz = np.asarray(start_state["tcp_pose"]["xyz"], dtype=float)
         q_seed_deg = self._state_to_arm_q_deg(start_state)
+        command_reference_joint_deg = {name: float(start_state["joint_state"][name]) for name in JOINTS}
         locked_joint_targets_deg = {
             joint_name: float(start_state["joint_state"][joint_name]) for joint_name in LOCKED_CARTESIAN_JOINTS
         }
-        if not wait:
-            ik = self._solve_ik_to_position(target_pos, q_seed_deg, locked_joint_targets_deg=locked_joint_targets_deg)
-            cmd = {name: float(ik["q_target_deg"][idx]) for idx, name in enumerate(ARM_JOINTS)}
-            return self._move_goal(cmd, duration=duration, wait=False, timeout=timeout)
-
-        step_m = max(1e-4, float(self.config.linear_step_m))
-        distance = float(np.linalg.norm(target_pos - start_xyz))
-        hz_steps = int(np.ceil(max(0.0, float(duration)) * max(1.0, float(self.config.cartesian_update_hz))))
-        steps = max(1, int(np.ceil(distance / step_m)), hz_steps)
-        step_duration = max(0.0, float(duration)) / steps if steps else 0.0
-        deadline = None if timeout is None else time.monotonic() + float(timeout)
         state = start_state
-        for step_index in range(1, steps + 1):
-            alpha = self._smooth_fraction(float(step_index) / float(steps))
-            waypoint_pos = start_xyz + (target_pos - start_xyz) * alpha
-            ik = self._solve_ik_to_position(
-                waypoint_pos,
-                q_seed_deg,
-                locked_joint_targets_deg=locked_joint_targets_deg,
-            )
-            cmd = {name: float(ik["q_target_deg"][idx]) for idx, name in enumerate(ARM_JOINTS)}
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            state = self._move_goal(cmd, duration=step_duration, wait=True, timeout=remaining)
-            q_seed_deg = self._state_to_arm_q_deg(state)
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        try:
+            if not wait:
+                ik = self._solve_ik_to_position(target_pos, q_seed_deg, locked_joint_targets_deg=locked_joint_targets_deg)
+                cmd = {name: float(ik["q_target_deg"][idx]) for idx, name in enumerate(ARM_JOINTS)}
+                trace_entry = None
+                if trace_steps is not None:
+                    trace_entry = {
+                        "mode": "cartesian",
+                        "step_index": 1,
+                        "steps_total": 1,
+                        "alpha": 1.0,
+                        "waypoint_tcp_target": self._xyz_dict(target_pos),
+                        "ik_target_joint_deg": cmd,
+                        "ik_pos_err_m": float(ik["pos_err_m"]),
+                        "ik_iterations": int(ik["iterations"]),
+                    }
+                state = self._move_goal(
+                    cmd,
+                    duration=duration,
+                    wait=False,
+                    timeout=timeout,
+                    command_reference_joint_deg=command_reference_joint_deg,
+                    trace_entry=trace_entry,
+                )
+                if trace_entry is not None:
+                    trace_steps.append(trace_entry)
+                command_reference_joint_deg.update({name: float(value) for name, value in cmd.items()})
+                return state
 
-        final_state = self._hold_current_pose()
-        if self.config.cartesian_settle_time_s > 0.0:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            settle_time = float(self.config.cartesian_settle_time_s)
-            if remaining is not None:
-                settle_time = min(settle_time, remaining)
-            if settle_time > 0.0:
-                time.sleep(settle_time)
-                final_state = self.get_state()
-        final_err = self._tcp_position_error_m(final_state, target_pos)
-        if final_err > self.config.max_ee_pos_err_m:
-            raise IKError(
-                f"Cartesian move settled with {final_err:.6f} m position error "
-                f"(limit {self.config.max_ee_pos_err_m:.6f} m)"
-            )
-        return final_state
+            step_m = max(1e-4, float(self.config.linear_step_m))
+            distance = float(np.linalg.norm(target_pos - start_xyz))
+            hz_steps = int(np.ceil(max(0.0, float(duration)) * max(1.0, float(self.config.cartesian_update_hz))))
+            steps = max(1, int(np.ceil(distance / step_m)), hz_steps)
+            step_duration = max(0.0, float(duration)) / steps if steps else 0.0
+            for step_index in range(1, steps + 1):
+                alpha = self._smooth_fraction(float(step_index) / float(steps))
+                waypoint_pos = start_xyz + (target_pos - start_xyz) * alpha
+                ik = self._solve_ik_to_position(
+                    waypoint_pos,
+                    q_seed_deg,
+                    locked_joint_targets_deg=locked_joint_targets_deg,
+                )
+                cmd = {name: float(ik["q_target_deg"][idx]) for idx, name in enumerate(ARM_JOINTS)}
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                trace_entry = None
+                if trace_steps is not None:
+                    trace_entry = {
+                        "mode": "cartesian",
+                        "step_index": int(step_index),
+                        "steps_total": int(steps),
+                        "alpha": float(alpha),
+                        "waypoint_tcp_target": self._xyz_dict(waypoint_pos),
+                        "ik_target_joint_deg": cmd,
+                        "ik_pos_err_m": float(ik["pos_err_m"]),
+                        "ik_iterations": int(ik["iterations"]),
+                    }
+                state = self._move_goal(
+                    cmd,
+                    duration=step_duration,
+                    wait=True,
+                    timeout=remaining,
+                    command_reference_joint_deg=command_reference_joint_deg,
+                    trace_entry=trace_entry,
+                )
+                if trace_entry is not None:
+                    trace_entry["after_tcp_pose"] = self._xyz_dict(state["tcp_pose"]["xyz"])
+                    trace_steps.append(trace_entry)
+                command_reference_joint_deg.update({name: float(value) for name, value in cmd.items()})
+                q_seed_deg = self._state_to_arm_q_deg(state)
+
+            final_state = self._hold_current_pose()
+            if self.config.cartesian_settle_time_s > 0.0:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                settle_time = float(self.config.cartesian_settle_time_s)
+                if remaining is not None:
+                    settle_time = min(settle_time, remaining)
+                if settle_time > 0.0:
+                    time.sleep(settle_time)
+                    final_state = self.get_state()
+            final_err = self._tcp_position_error_m(final_state, target_pos)
+            if final_err > self.config.max_ee_pos_err_m:
+                raise IKError(
+                    f"Cartesian move settled with {final_err:.6f} m position error "
+                    f"(limit {self.config.max_ee_pos_err_m:.6f} m)"
+                )
+            return final_state
+        except Exception as exc:
+            if trace_steps is None:
+                raise
+            error_type = exc.__class__.__name__
+            details = {
+                "trace": self._finalize_trace(trace_steps),
+                "last_state": state,
+                "target_tcp": self._xyz_dict(target_pos),
+                "start_tcp": self._xyz_dict(start_xyz),
+                "error_type": error_type,
+            }
+            if isinstance(exc, IKTraceError):
+                exc.details.update(details)
+                raise
+            raise IKTraceError(str(exc), details=details) from exc
 
     def _move_joint_targets_smooth(
         self,
@@ -830,9 +1164,28 @@ class SoArmMoceController:
         wait: bool,
         timeout: Optional[float],
         step_size: Optional[float] = None,
+        trace_steps: Optional[list[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if not wait:
-            return self._move_goal(target_cmd, duration=duration, wait=False, timeout=timeout)
+            trace_entry = None
+            if trace_steps is not None:
+                trace_entry = {
+                    "mode": "joint",
+                    "step_index": 1,
+                    "steps_total": 1,
+                    "alpha": 1.0,
+                }
+            state = self._move_goal(
+                target_cmd,
+                duration=duration,
+                wait=False,
+                timeout=timeout,
+                command_reference_joint_deg={name: float(start_state["joint_state"][name]) for name in JOINTS},
+                trace_entry=trace_entry,
+            )
+            if trace_entry is not None:
+                trace_steps.append(trace_entry)
+            return state
 
         resolved_step_size = max(1e-4, float(step_size or self.config.joint_step_deg))
         max_change = max(
@@ -844,6 +1197,7 @@ class SoArmMoceController:
         step_duration = max(0.0, float(duration)) / steps if steps else 0.0
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         state = start_state
+        command_reference_joint_deg = {name: float(start_state["joint_state"][name]) for name in JOINTS}
         for step_index in range(1, steps + 1):
             alpha = self._smooth_fraction(float(step_index) / float(steps))
             waypoint_cmd = {
@@ -852,7 +1206,25 @@ class SoArmMoceController:
                 for joint_name, target_value in target_cmd.items()
             }
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            state = self._move_goal(waypoint_cmd, duration=step_duration, wait=True, timeout=remaining)
+            trace_entry = None
+            if trace_steps is not None:
+                trace_entry = {
+                    "mode": "joint",
+                    "step_index": int(step_index),
+                    "steps_total": int(steps),
+                    "alpha": float(alpha),
+                }
+            state = self._move_goal(
+                waypoint_cmd,
+                duration=step_duration,
+                wait=True,
+                timeout=remaining,
+                command_reference_joint_deg=command_reference_joint_deg,
+                trace_entry=trace_entry,
+            )
+            if trace_entry is not None:
+                trace_steps.append(trace_entry)
+            command_reference_joint_deg.update({name: float(value) for name, value in waypoint_cmd.items()})
         return self._hold_current_pose()
 
     @staticmethod
@@ -878,3 +1250,25 @@ class SoArmMoceController:
     def _smooth_fraction(fraction: float) -> float:
         t = min(1.0, max(0.0, float(fraction)))
         return t * t * (3.0 - 2.0 * t)
+
+    @staticmethod
+    def _finalize_trace(trace_steps: list[Dict[str, Any]]) -> Dict[str, Any]:
+        if not trace_steps:
+            return {"steps": [], "summary": {"steps": 0}}
+        joint_names = list(JOINTS)
+        max_abs_joint_error_deg = {
+            name: max(abs(float(step.get("joint_error_deg", {}).get(name, 0.0))) for step in trace_steps)
+            for name in joint_names
+        }
+        max_abs_raw_delta = {
+            name: max(abs(int(step.get("raw_present_position_delta", {}).get(name, 0))) for step in trace_steps)
+            for name in joint_names
+        }
+        return {
+            "steps": trace_steps,
+            "summary": {
+                "steps": len(trace_steps),
+                "max_abs_joint_error_deg": max_abs_joint_error_deg,
+                "max_abs_raw_delta": max_abs_raw_delta,
+            },
+        }

@@ -44,10 +44,22 @@ metadata:
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_state.py
 ```
 
+### 1.1) 只读 IK 诊断
+
+```bash
+python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_diag_ik.py --dx 0.02 --frame base
+```
+
 ### 2) 小步笛卡尔移动
 
 ```bash
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py delta --dz 0.01 --frame base
+```
+
+需要排查多圈关节执行误差时，给运动命令加 `--trace`：
+
+```bash
+python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py delta --dy 0.05 --frame base --duration 2.0 --trace
 ```
 
 ### 3) 绝对 XYZ 移动
@@ -104,7 +116,7 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 ## 环境变量
 
 - `SOARMMOCE_PORT`：串口，默认 `/dev/ttyACM0`
-- `SOARMMOCE_ROBOT_ID`：标定 ID，默认 `follower_moce`
+- `SOARMMOCE_ROBOT_ID`：标定 ID，默认优先 `soarmmoce`，找不到再回退 `follower_moce`
 - `SOARMMOCE_CALIB_DIR`：标定目录
 - `SOARMMOCE_URDF_PATH`：URDF 路径，默认优先使用 `sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf`
 - `SOARMMOCE_TARGET_FRAME`：末端 frame，默认 `wrist_roll`（按当前 5DOF 链截断）
@@ -137,9 +149,12 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 对 `上/下/左/右` 默认使用 `frame="base"`。
 只有用户明确要求沿末端当前方向前进/后退时，才优先使用 `frame="tool"`。
 
+串口相关脚本不要并行运行；同一时刻只保留一个 `state/move/diag` 进程，否则容易出现假性的缺电机 ID 或端口占用。
+
 ## 参考文件
 
 - `skills/soarmmoce-real-con/scripts/soarmmoce_sdk.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_state.py`
+- `skills/soarmmoce-real-con/scripts/soarmmoce_diag_ik.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_move.py`
 - `skills/soarmmoce-real-con/agents/openai.yaml`

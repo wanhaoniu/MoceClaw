@@ -23,6 +23,7 @@ def main() -> None:
     p_delta.add_argument("--duration", type=float, default=1.0)
     p_delta.add_argument("--wait", type=cli_bool, default=True)
     p_delta.add_argument("--timeout", type=float, default=None)
+    p_delta.add_argument("--trace", action="store_true")
 
     p_xyz = sub.add_parser("xyz", help="Move TCP to absolute x/y/z")
     p_xyz.add_argument("--x", type=float, default=None)
@@ -31,6 +32,7 @@ def main() -> None:
     p_xyz.add_argument("--duration", type=float, default=1.0)
     p_xyz.add_argument("--wait", type=cli_bool, default=True)
     p_xyz.add_argument("--timeout", type=float, default=None)
+    p_xyz.add_argument("--trace", action="store_true")
 
     p_joint = sub.add_parser("joint", help="Move one joint")
     p_joint.add_argument("--joint", required=True)
@@ -39,17 +41,20 @@ def main() -> None:
     p_joint.add_argument("--duration", type=float, default=1.0)
     p_joint.add_argument("--wait", type=cli_bool, default=True)
     p_joint.add_argument("--timeout", type=float, default=None)
+    p_joint.add_argument("--trace", action="store_true")
 
     p_joints = sub.add_parser("joints", help="Move multiple joints with JSON targets")
     p_joints.add_argument("--targets-json", required=True, help='JSON object, e.g. {"wrist_roll": 5}')
     p_joints.add_argument("--duration", type=float, default=1.0)
     p_joints.add_argument("--wait", type=cli_bool, default=True)
     p_joints.add_argument("--timeout", type=float, default=None)
+    p_joints.add_argument("--trace", action="store_true")
 
     p_home = sub.add_parser("home", help="Move to configured home pose")
     p_home.add_argument("--duration", type=float, default=1.5)
     p_home.add_argument("--wait", type=cli_bool, default=True)
     p_home.add_argument("--timeout", type=float, default=None)
+    p_home.add_argument("--trace", action="store_true")
 
     sub.add_parser("stop", help="Hold current pose")
 
@@ -66,6 +71,7 @@ def main() -> None:
                 duration=args.duration,
                 wait=args.wait,
                 timeout=args.timeout,
+                trace=args.trace,
             )
         elif args.cmd == "xyz":
             result = arm.move_to(
@@ -75,6 +81,7 @@ def main() -> None:
                 duration=args.duration,
                 wait=args.wait,
                 timeout=args.timeout,
+                trace=args.trace,
             )
         elif args.cmd == "joint":
             result = arm.move_joint(
@@ -84,6 +91,7 @@ def main() -> None:
                 duration=args.duration,
                 wait=args.wait,
                 timeout=args.timeout,
+                trace=args.trace,
             )
         elif args.cmd == "joints":
             try:
@@ -95,9 +103,10 @@ def main() -> None:
                 duration=args.duration,
                 wait=args.wait,
                 timeout=args.timeout,
+                trace=args.trace,
             )
         elif args.cmd == "home":
-            result = arm.home(duration=args.duration, wait=args.wait, timeout=args.timeout)
+            result = arm.home(duration=args.duration, wait=args.wait, timeout=args.timeout, trace=args.trace)
         else:
             result = arm.stop()
         print_success(result)

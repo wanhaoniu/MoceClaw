@@ -1,5 +1,5 @@
 from .robot import Robot
-from .types import GripperState, JointState, PermissionState, Pose, RobotState
+from .types import GripperState, JointState, PermissionState, Pose, RobotState, TwinState
 from .errors import (
     CapabilityError,
     ConnectionError,
@@ -18,6 +18,7 @@ __all__ = [
     "GripperState",
     "PermissionState",
     "RobotState",
+    "TwinState",
     "SoarmMoceError",
     "ConnectionError",
     "ProtocolError",
