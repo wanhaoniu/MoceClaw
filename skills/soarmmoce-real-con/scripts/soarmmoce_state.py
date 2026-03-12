@@ -14,14 +14,11 @@ import kinpy as kp
 import numpy as np
 
 from soarmmoce_cli_common import run_and_print
-from soarmmoce_sdk import SoArmMoceController
+from soarmmoce_sdk import DEFAULT_MODEL_OFFSETS_DEG, SoArmMoceController
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OFFSETS_DEG = {
-    "shoulder_lift": -90.0,
-    "wrist_flex": -180.0,
-}
+DEFAULT_OFFSETS_DEG = dict(DEFAULT_MODEL_OFFSETS_DEG)
 
 
 def _parse_offsets_json(raw: str) -> Dict[str, float]:
@@ -82,7 +79,11 @@ def diagnose_model(offsets_deg: Dict[str, float]) -> Dict[str, Any]:
 
     active_chain = arm._ensure_kin_chain()
     active_joint_names = list(active_chain.get_joint_parameter_names())
-    active_report = _chain_report(active_chain, q_deg, active_joint_names)
+    active_offsets_vec = np.array(
+        [float(arm.config.model_offsets_deg.get(name, 0.0)) for name in active_joint_names],
+        dtype=float,
+    )
+    active_report = _chain_report(active_chain, q_deg + active_offsets_vec, active_joint_names)
 
     offsets_vec = np.array([float(offsets_deg.get(name, 0.0)) for name in active_joint_names], dtype=float)
     active_offset_report = _chain_report(active_chain, q_deg + offsets_vec, active_joint_names)
@@ -104,6 +105,7 @@ def diagnose_model(offsets_deg: Dict[str, float]) -> Dict[str, Any]:
             "urdf_path": str(arm.config.urdf_path),
             "target_frame": str(arm.config.target_frame),
             "calibration_path": str(calib_path),
+            "model_offsets_deg": dict(arm.config.model_offsets_deg),
         },
         "raw_motor_present_position": raw_motor,
         "joint_state_deg": state["joint_state"],

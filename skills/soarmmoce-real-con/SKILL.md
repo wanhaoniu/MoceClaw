@@ -17,10 +17,9 @@ metadata:
   - `scripts/soarmmoce_sdk.py`：SDK 风格控制逻辑
   - `scripts/soarmmoce_state.py` / `scripts/soarmmoce_move.py`：命令行入口
 - 当前 TCP 笛卡尔控制按 `5DOF position-only IK` 工作，只解末端位置 `x/y/z`，不再强行约束完整 6D 姿态。
-- 对 `delta/xyz` 这类笛卡尔移动，默认锁住 `wrist_roll`，避免横移时为了凑位置把末端滚转甩开。
+- 对 `delta/xyz` 这类笛卡尔移动，默认锁住 `wrist_flex + wrist_roll`，避免 4/5 号在只解 `xyz` 时自己乱补姿态。
 - 轨迹下发默认按时间频率连续插值，并使用平滑缓入缓出，避免单步跳变太大导致动作发卡。
 - 2 号关节 `shoulder_lift` 与 3 号关节 `elbow_flex` 已分别按减速比 `5.3 / 5.6` 做换算，底层运行在多圈模式。
-- 当前对 2/3 号多圈关节采用 `方案 A`：读状态时临时使用 `position mode`，发多圈步进命令时切回 `step mode`，这样才能既读到位置又继续用步进控制。
 - 当前机械臂没有安装 6 号夹爪舵机，不要调用夹爪脚本或夹爪 API。
 
 ## 何时使用
@@ -45,8 +44,6 @@ metadata:
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_state.py
 ```
 
-标定完多圈关节后，`state.joint_state.shoulder_lift / elbow_flex` 会返回用于运动和 IK 的关节角；如果你还想看多圈软件零点下的连续量，读 `state.multi_turn_state.relative_raw / joint_deg_from_home`。
-
 ### 1.1) 只读 IK 诊断
 
 ```bash
@@ -55,7 +52,7 @@ python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_diag_ik.py --dx 
 
 ### 1.2) 自动标定
 
-运行前先把机械臂摆到你认定的 `home` 姿态。脚本会以当前姿态作为 `home` 参考位；单圈关节自动向正负两个方向寻限位，多圈关节也会自动向正负两个方向寻限位，但实际位置读取统一走 `position mode + 软件展开`。多圈结果不再依赖 `homing_offset`，而是写入 `home_wrapped_raw + min_relative_raw/max_relative_raw`。
+运行前先把机械臂摆到你认定的 `home` 姿态。脚本会以当前姿态作为 `home` 参考位，然后自动向正负两个方向寻限位，并把结果写到 `skills/soarmmoce-real-con/calibration/<robot_id>.json`。
 
 ```bash
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_auto_calibrate.py
@@ -65,42 +62,6 @@ python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_auto_calibrate.p
 
 ```bash
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_auto_calibrate.py --apply-registers false
-```
-
-### 1.3) 手动标定
-
-运行方式对齐 `lerobot-calibrate` 的参数风格。脚本会在交互过程中让你手动把机械臂摆到目标 `home` 姿态；单圈和多圈关节都要再手动掰到整段活动范围。多圈关节在这里会把当前 `home` 姿态记成软件零点，再把整段范围记录成相对 `home` 的连续 raw。捕获 `home` 时脚本会实时打印 `HOME_RAW / WRAPPED / REF`，其中多圈关节的 `REF` 固定为 `0`；随后会再打印一次 `CAPTURED_RAW / HOME_ZERO`，需要你输入 `ok` 才继续。
-
-```bash
-python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_manual_calibrate.py \
-  --robot.type=soarmmoce \
-  --robot.port=/dev/ttyACM0 \
-  --robot.id=soarmmoce
-```
-
-如果只想预览结果，不回写寄存器也不保存 JSON：
-
-```bash
-python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_manual_calibrate.py \
-  --robot.type=soarmmoce \
-  --robot.port=/dev/ttyACM0 \
-  --robot.id=soarmmoce \
-  --robot.apply_registers=false \
-  --robot.save_json=false
-```
-
-### 1.4) 多圈极限位测试
-
-这个脚本会读取当前多圈状态和标定 JSON，基于 `min_relative_raw/max_relative_raw` 规划相对 `home` 的目标位，并在范围看起来不可信时直接拒绝执行。
-
-```bash
-python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_test_calibrated_limits.py
-```
-
-确认计划没问题后，再执行真实运动：
-
-```bash
-python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_test_calibrated_limits.py --execute=true
 ```
 
 ### 2) 小步笛卡尔移动
@@ -132,6 +93,27 @@ python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py joint --
 ```bash
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py home
 ```
+
+### 6) 人脸居中跟随
+
+先启动 `face_loc` 服务，再运行：
+
+```bash
+python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_face_follow.py --face-endpoint http://127.0.0.1:8011
+```
+
+当前默认行为：
+
+- `shoulder_pan` 做水平居中
+- `shoulder_lift + elbow_flex` 做垂直居中
+- 默认先只做画面内 `x/y` 居中，不主动做前后距离修正
+- 当前默认方向符号固定为最近一次验证通过的组合：`pan=+1`、`tilt_primary=+1`、`tilt_secondary=-1`
+- 丢失人脸时不报错，改为自动左右扫描寻找人脸
+- 脚本会持续运行，直到你手动 `Ctrl+C` 停止
+
+如果你还想额外叠加整体升降修正，再显式加 `--enable-lift true`。
+如果你只想保留单个垂直关节，可以显式加 `--tilt-secondary-joint none`。
+如果你还想恢复前后距离跟随，再显式加 `--enable-depth true`。
 
 ## SDK 直接调用
 
@@ -175,6 +157,7 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 - `SOARMMOCE_TARGET_FRAME`：末端 frame，默认 `wrist_roll`（按当前 5DOF 链截断）
 - `SOARMMOCE_HOME_JOINTS_JSON`：覆盖 home 目标关节
 - `SOARMMOCE_JOINT_SCALE_JSON`：覆盖关节减速比/方向，默认 `{"shoulder_pan":1.0,"shoulder_lift":5.3,"elbow_flex":5.6,"wrist_flex":1.0,"wrist_roll":1.0}`
+- `SOARMMOCE_MODEL_OFFSETS_JSON`：覆盖 URDF 模型角度偏置，默认 `{"shoulder_pan":0.0,"shoulder_lift":-90.0,"elbow_flex":0.0,"wrist_flex":-180.0,"wrist_roll":0.0}`
 - `SOARMMOCE_LINEAR_STEP_M`：笛卡尔插值步长，默认 `0.01`
 - `SOARMMOCE_JOINT_STEP_DEG`：关节插值步长，默认 `5.0`
 - `SOARMMOCE_CARTESIAN_UPDATE_HZ`：笛卡尔轨迹下发频率，默认 `20.0`
@@ -210,7 +193,6 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 
 - `skills/soarmmoce-real-con/scripts/soarmmoce_sdk.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_auto_calibrate.py`
-- `skills/soarmmoce-real-con/scripts/soarmmoce_manual_calibrate.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_state.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_diag_ik.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_move.py`

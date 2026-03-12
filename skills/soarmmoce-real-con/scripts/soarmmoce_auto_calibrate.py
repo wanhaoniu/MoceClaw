@@ -55,9 +55,7 @@ def _unwrap_position_raw(joint: str, wrapped_raw: int, tracker: Dict[str, Dict[s
         return int(wrapped_raw)
     state = tracker.get(joint)
     if state is None:
-        # Preserve the first multi-turn sample as reported by the motor instead of
-        # collapsing it into a single-turn [0, 4096) bucket.
-        continuous = float(wrapped_raw)
+        continuous = float(wrapped)
     else:
         last_wrapped = float(state["last_wrapped_raw"])
         last_continuous = float(state["continuous_raw"])
@@ -74,15 +72,7 @@ def _unwrap_position_raw(joint: str, wrapped_raw: int, tracker: Dict[str, Dict[s
     return int(round(continuous))
 
 
-def _read_joint_snapshot(
-    bus,
-    joint: str,
-    tracker: Dict[str, Dict[str, float]] | None = None,
-    *,
-    arm: SoArmMoceController | None = None,
-) -> Dict[str, Any]:
-    if joint in MULTI_TURN_JOINTS and arm is not None:
-        arm._ensure_multi_turn_read_mode(bus)
+def _read_joint_snapshot(bus, joint: str, tracker: Dict[str, Dict[str, float]] | None = None) -> Dict[str, Any]:
     wrapped_raw = int(bus.read("Present_Position", joint, normalize=False))
     position_key = _unwrap_position_raw(joint, wrapped_raw, tracker)
     return {
@@ -94,20 +84,10 @@ def _read_joint_snapshot(
     }
 
 
-def _command_goal_from_reference(
-    bus,
-    joint: str,
-    direction: int,
-    step_raw: int,
-    reference_position_raw: int,
-    *,
-    arm: SoArmMoceController | None = None,
-) -> Dict[str, Any]:
+def _command_goal_from_reference(bus, joint: str, direction: int, step_raw: int, reference_position_raw: int) -> Dict[str, Any]:
     direction = 1 if direction >= 0 else -1
     step_raw = max(1, int(step_raw))
     if joint in MULTI_TURN_JOINTS:
-        if arm is not None:
-            arm._ensure_multi_turn_step_mode(bus)
         goal_value = int(direction * step_raw)
     else:
         goal_value = int(min(4095, max(0, int(reference_position_raw) + direction * step_raw)))
@@ -119,16 +99,8 @@ def _command_goal_from_reference(
     }
 
 
-def _hold_joint(
-    bus,
-    joint: str,
-    reference_position_raw: int | None = None,
-    *,
-    arm: SoArmMoceController | None = None,
-) -> None:
+def _hold_joint(bus, joint: str, reference_position_raw: int | None = None) -> None:
     if joint in MULTI_TURN_JOINTS:
-        if arm is not None:
-            arm._ensure_multi_turn_step_mode(bus)
         bus.write("Goal_Position", joint, 0, normalize=False)
         return
     if reference_position_raw is None:
@@ -151,7 +123,6 @@ def _backoff_from_limit(
     attempts: int,
     reference_position_raw: int,
     tracker: Dict[str, Dict[str, float]] | None,
-    arm: SoArmMoceController | None,
 ) -> Dict[str, Any]:
     last_exc: Exception | None = None
     last_reference = int(reference_position_raw)
@@ -162,12 +133,11 @@ def _backoff_from_limit(
             -int(approach_direction),
             max(1, int(retreat_step_raw)),
             last_reference,
-            arm=arm,
         )
         time.sleep(max(0.02, float(poll_interval_s)))
         try:
-            snap = _read_joint_snapshot(bus, joint, tracker=tracker, arm=arm)
-            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]), arm=arm)
+            snap = _read_joint_snapshot(bus, joint, tracker=tracker)
+            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]))
             return snap
         except Exception as exc:  # pragma: no cover - hardware path
             last_exc = exc
@@ -193,7 +163,6 @@ def _seek_limit(
     stall_current_abs_threshold: float,
     timeout_s: float,
     tracker: Dict[str, Dict[str, float]] | None,
-    arm: SoArmMoceController | None = None,
 ) -> Dict[str, Any]:
     start_ts = time.time()
     pos_hist: deque[int] = deque(maxlen=max(2, int(settle_samples)))
@@ -201,7 +170,7 @@ def _seek_limit(
     max_abs_current = 0.0
     direction_name = "positive" if direction >= 0 else "negative"
     release_step_raw = max(int(step_raw), int(step_raw) * 2)
-    last_snap = _read_joint_snapshot(bus, joint, tracker=tracker, arm=arm)
+    last_snap = _read_joint_snapshot(bus, joint, tracker=tracker)
     pos_hist.append(int(last_snap["position"]))
 
     while True:
@@ -211,11 +180,10 @@ def _seek_limit(
             direction,
             step_raw,
             int(last_snap["position_wrapped"]),
-            arm=arm,
         )
         time.sleep(max(0.01, float(poll_interval_s)))
         try:
-            snap = _read_joint_snapshot(bus, joint, tracker=tracker, arm=arm)
+            snap = _read_joint_snapshot(bus, joint, tracker=tracker)
         except Exception as exc:
             if not _is_limit_fault(exc):
                 raise
@@ -228,7 +196,6 @@ def _seek_limit(
                 attempts=max(2, int(settle_samples)),
                 reference_position_raw=int(last_snap["position_wrapped"]),
                 tracker=tracker,
-                arm=arm,
             )
             return {
                 "joint": joint,
@@ -277,7 +244,7 @@ def _seek_limit(
             samples.append(sample)
 
         if len(pos_hist) >= max(2, int(settle_samples)) and low_velocity and not_moving and barely_moving:
-            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]), arm=arm)
+            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]))
             recovered = _backoff_from_limit(
                 bus=bus,
                 joint=joint,
@@ -287,7 +254,6 @@ def _seek_limit(
                 attempts=1,
                 reference_position_raw=int(snap["position_wrapped"]),
                 tracker=tracker,
-                arm=arm,
             )
             return {
                 "joint": joint,
@@ -304,7 +270,7 @@ def _seek_limit(
         if len(pos_hist) >= max(2, int(settle_samples)) and (
             (stall_current and barely_moving) or multi_turn_stall
         ):
-            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]), arm=arm)
+            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]))
             recovered = _backoff_from_limit(
                 bus=bus,
                 joint=joint,
@@ -314,7 +280,6 @@ def _seek_limit(
                 attempts=max(2, int(settle_samples)),
                 reference_position_raw=int(snap["position_wrapped"]),
                 tracker=tracker,
-                arm=arm,
             )
             return {
                 "joint": joint,
@@ -330,7 +295,7 @@ def _seek_limit(
 
         if time.time() - start_ts > float(timeout_s):
             if timeout_limit_like:
-                _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]), arm=arm)
+                _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]))
                 recovered = _backoff_from_limit(
                     bus=bus,
                     joint=joint,
@@ -340,7 +305,6 @@ def _seek_limit(
                     attempts=max(2, int(settle_samples)),
                     reference_position_raw=int(snap["position_wrapped"]),
                     tracker=tracker,
-                    arm=arm,
                 )
                 return {
                     "joint": joint,
@@ -353,7 +317,7 @@ def _seek_limit(
                     "max_abs_current": float(max_abs_current),
                     "samples": samples,
                 }
-            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]), arm=arm)
+            _hold_joint(bus, joint, reference_position_raw=int(snap["position_wrapped"]))
             raise TimeoutError(
                 f"Timed out while seeking {direction_name} limit for {joint}. "
                 f"Last snapshot: pos={snap['position']} vel={snap['velocity']} moving={snap['moving']} current={snap['current']}"
@@ -371,14 +335,13 @@ def _move_joint_back_to_target(
     timeout_s: float,
     position_tolerance_raw: int = 6,
     tracker: Dict[str, Dict[str, float]] | None = None,
-    arm: SoArmMoceController | None = None,
 ) -> Dict[str, Any]:
     start_ts = time.time()
-    last_snap = _read_joint_snapshot(bus, joint, tracker=tracker, arm=arm)
+    last_snap = _read_joint_snapshot(bus, joint, tracker=tracker)
     while True:
         error = int(target_present_raw) - int(last_snap["position"])
         if abs(error) <= int(position_tolerance_raw):
-            _hold_joint(bus, joint, reference_position_raw=int(last_snap["position_wrapped"]), arm=arm)
+            _hold_joint(bus, joint, reference_position_raw=int(last_snap["position_wrapped"]))
             return {
                 "joint": joint,
                 "target_present_raw": int(target_present_raw),
@@ -388,11 +351,11 @@ def _move_joint_back_to_target(
             }
         direction = 1 if error > 0 else -1
         cmd_step = min(abs(error), max(1, int(step_raw)))
-        _command_goal_from_reference(bus, joint, direction, cmd_step, int(last_snap["position_wrapped"]), arm=arm)
+        _command_goal_from_reference(bus, joint, direction, cmd_step, int(last_snap["position_wrapped"]))
         time.sleep(max(0.01, float(poll_interval_s)))
-        last_snap = _read_joint_snapshot(bus, joint, tracker=tracker, arm=arm)
+        last_snap = _read_joint_snapshot(bus, joint, tracker=tracker)
         if time.time() - start_ts > float(timeout_s):
-            _hold_joint(bus, joint, reference_position_raw=int(last_snap["position_wrapped"]), arm=arm)
+            _hold_joint(bus, joint, reference_position_raw=int(last_snap["position_wrapped"]))
             raise TimeoutError(
                 f"Timed out while returning {joint} to home reference. "
                 f"target={target_present_raw}, last={last_snap['position']}"
@@ -404,58 +367,6 @@ def _desired_home_present_raw(max_res: int, motor_home_deg: float) -> int:
     return int(round(half_turn + float(motor_home_deg) * float(max_res) / 360.0))
 
 
-def _build_multi_turn_calibration_entry(
-    *,
-    current_cal: Any,
-    home_present_raw: int,
-    home_present_wrapped_raw: int,
-    min_present_raw: int,
-    max_present_raw: int,
-) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    observed_home_raw = int(home_present_raw)
-    observed_home_wrapped_raw = int(home_present_wrapped_raw) % RAW_COUNTS_PER_REV
-    observed_min_raw = int(min_present_raw)
-    observed_max_raw = int(max_present_raw)
-    if observed_min_raw >= observed_max_raw:
-        raise RuntimeError(
-            f"Invalid multi-turn span: min={observed_min_raw}, max={observed_max_raw}"
-        )
-    if not (observed_min_raw <= observed_home_raw <= observed_max_raw):
-        raise RuntimeError(
-            "The captured multi-turn home pose must lie inside the recorded range: "
-            f"home={observed_home_raw}, min={observed_min_raw}, max={observed_max_raw}"
-        )
-
-    min_relative_raw = int(observed_min_raw - observed_home_raw)
-    max_relative_raw = int(observed_max_raw - observed_home_raw)
-    if min_relative_raw >= max_relative_raw:
-        raise RuntimeError(
-            f"Invalid multi-turn relative span: min={min_relative_raw}, max={max_relative_raw}"
-        )
-
-    entry = {
-        "id": int(current_cal.id),
-        "drive_mode": int(current_cal.drive_mode),
-        "homing_offset": 0,
-        "range_min": 0,
-        "range_max": RAW_COUNTS_PER_REV - 1,
-        "home_wrapped_raw": int(observed_home_wrapped_raw),
-        "min_relative_raw": int(min_relative_raw),
-        "max_relative_raw": int(max_relative_raw),
-    }
-    result = {
-        "calibration_mode": "relative_home_multiturn",
-        "home_present_raw": int(observed_home_raw),
-        "home_present_wrapped_raw": int(observed_home_wrapped_raw),
-        "observed_range_min_raw": int(observed_min_raw),
-        "observed_range_max_raw": int(observed_max_raw),
-        "min_relative_raw": int(min_relative_raw),
-        "max_relative_raw": int(max_relative_raw),
-        "note": "multi-turn joint: software zero is the captured home pose and limits are stored as relative continuous raw",
-    }
-    return entry, result
-
-
 def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     config = resolve_config()
     output_path = (
@@ -465,7 +376,7 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     )
     joints = list(args.joints)
 
-    with SoArmMoceController(config, allow_uncalibrated_multiturn=True) as arm:
+    with SoArmMoceController(config) as arm:
         bus = arm._ensure_bus()
         try:
             current_hw_calib = bus.read_calibration()
@@ -475,18 +386,17 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
             home_present_raw: Dict[str, int] = {}
             home_present_wrapped_raw: Dict[str, int] = {}
             for joint in joints:
-                snap = _read_joint_snapshot(bus, joint, tracker=tracker, arm=arm)
+                snap = _read_joint_snapshot(bus, joint, tracker=tracker)
                 home_present_raw[joint] = int(snap["position"])
                 home_present_wrapped_raw[joint] = int(snap["position_wrapped"])
 
             for joint in joints:
+                if joint in MULTI_TURN_JOINTS:
+                    continue
                 model = bus.motors[joint].model
                 max_res = int(bus.model_resolution_table[model] - 1)
-                if joint in MULTI_TURN_JOINTS:
-                    arm._ensure_multi_turn_read_mode(bus)
-                else:
-                    bus.write("Min_Position_Limit", joint, 0, normalize=False)
-                    bus.write("Max_Position_Limit", joint, max_res, normalize=False)
+                bus.write("Min_Position_Limit", joint, 0, normalize=False)
+                bus.write("Max_Position_Limit", joint, max_res, normalize=False)
 
             results: Dict[str, Any] = {}
             min_present_raw: Dict[str, int] = {}
@@ -506,7 +416,6 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                     stall_current_abs_threshold=args.stall_current_abs_threshold,
                     timeout_s=args.timeout_s,
                     tracker=tracker,
-                    arm=arm,
                 )
                 min_present_raw[joint] = int(neg_limit["limit_present_raw"])
 
@@ -518,7 +427,6 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                     poll_interval_s=args.poll_interval_s,
                     timeout_s=max(args.timeout_s, 2.0),
                     tracker=tracker,
-                    arm=arm,
                 )
 
                 pos_limit = _seek_limit(
@@ -533,7 +441,6 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                     stall_current_abs_threshold=args.stall_current_abs_threshold,
                     timeout_s=args.timeout_s,
                     tracker=tracker,
-                    arm=arm,
                 )
                 max_present_raw[joint] = int(pos_limit["limit_present_raw"])
 
@@ -545,11 +452,9 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                     poll_interval_s=args.poll_interval_s,
                     timeout_s=max(args.timeout_s, 2.0),
                     tracker=tracker,
-                    arm=arm,
                 )
 
                 results[joint] = {
-                    "calibration_mode": "relative_home_multiturn" if joint in MULTI_TURN_JOINTS else "auto_limits",
                     "negative_limit": neg_limit,
                     "return_from_negative": back_from_neg,
                     "positive_limit": pos_limit,
@@ -559,61 +464,41 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                 }
 
             written_json = dict(source_calib_json) if isinstance(source_calib_json, dict) else {}
-            register_writes: Dict[str, Dict[str, Any]] = {}
+            register_writes: Dict[str, Dict[str, int]] = {}
 
             for joint in joints:
                 current_cal = current_hw_calib[joint]
                 model = bus.motors[joint].model
                 max_res = int(bus.model_resolution_table[model] - 1)
-                if joint in MULTI_TURN_JOINTS:
-                    entry, result_payload = _build_multi_turn_calibration_entry(
-                        current_cal=current_cal,
-                        home_present_raw=int(home_present_raw[joint]),
-                        home_present_wrapped_raw=int(home_present_wrapped_raw[joint]),
-                        min_present_raw=int(min_present_raw[joint]),
-                        max_present_raw=int(max_present_raw[joint]),
-                    )
-                    written_json[joint] = entry
-                    register_writes[joint] = {
-                        "homing_offset": int(entry["homing_offset"]),
-                        "range_min": int(entry["range_min"]),
-                        "range_max": int(entry["range_max"]),
-                        "home_wrapped_raw": int(entry["home_wrapped_raw"]),
-                        "min_relative_raw": int(entry["min_relative_raw"]),
-                        "max_relative_raw": int(entry["max_relative_raw"]),
-                        "calibration_mode": str(result_payload["calibration_mode"]),
-                    }
-                    results[joint].update(result_payload)
-                else:
-                    motor_home_deg = arm._joint_to_motor_deg(joint, float(config.home_joints.get(joint, 0.0)))
-                    desired_home = _desired_home_present_raw(max_res, motor_home_deg)
-                    new_offset = int(round(int(current_cal.homing_offset) + int(home_present_raw[joint]) - desired_home))
-                    new_min = int(round(int(min_present_raw[joint]) - int(home_present_raw[joint]) + desired_home))
-                    new_max = int(round(int(max_present_raw[joint]) - int(home_present_raw[joint]) + desired_home))
-                    if new_min >= new_max:
-                        raise RuntimeError(f"Invalid calibration span for {joint}: min={new_min}, max={new_max}")
-                    written_json[joint] = {
-                        "id": int(current_cal.id),
-                        "drive_mode": int(current_cal.drive_mode),
-                        "homing_offset": int(new_offset),
-                        "range_min": int(new_min),
-                        "range_max": int(new_max),
-                    }
-                    register_writes[joint] = {
-                        "homing_offset": int(new_offset),
-                        "range_min": int(new_min),
-                        "range_max": int(new_max),
-                        "desired_home_present_raw": int(desired_home),
-                        "calibration_mode": "auto_limits",
-                    }
-                    results[joint]["desired_home_present_raw"] = int(desired_home)
+                motor_home_deg = arm._joint_to_motor_deg(joint, float(config.home_joints.get(joint, 0.0)))
+                desired_home = _desired_home_present_raw(max_res, motor_home_deg)
+                new_offset = int(round(int(current_cal.homing_offset) + int(home_present_raw[joint]) - desired_home))
+                new_min = int(round(int(min_present_raw[joint]) - int(home_present_raw[joint]) + desired_home))
+                new_max = int(round(int(max_present_raw[joint]) - int(home_present_raw[joint]) + desired_home))
+                if new_min >= new_max:
+                    raise RuntimeError(f"Invalid calibration span for {joint}: min={new_min}, max={new_max}")
+
+                written_json[joint] = {
+                    "id": int(current_cal.id),
+                    "drive_mode": int(current_cal.drive_mode),
+                    "homing_offset": int(new_offset),
+                    "range_min": int(new_min),
+                    "range_max": int(new_max),
+                }
+                register_writes[joint] = {
+                    "homing_offset": int(new_offset),
+                    "range_min": int(new_min),
+                    "range_max": int(new_max),
+                    "desired_home_present_raw": int(desired_home),
+                }
 
             if args.apply_registers:
                 for joint in joints:
                     write_spec = register_writes[joint]
                     bus.write("Homing_Offset", joint, int(write_spec["homing_offset"]), normalize=False)
-                    bus.write("Min_Position_Limit", joint, int(write_spec["range_min"]), normalize=False)
-                    bus.write("Max_Position_Limit", joint, int(write_spec["range_max"]), normalize=False)
+                    if joint not in MULTI_TURN_JOINTS:
+                        bus.write("Min_Position_Limit", joint, int(write_spec["range_min"]), normalize=False)
+                        bus.write("Max_Position_Limit", joint, int(write_spec["range_max"]), normalize=False)
 
             if args.save_json:
                 _write_json(output_path, written_json)
@@ -627,7 +512,6 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                 "saved_json": bool(args.save_json),
                 "applied_registers": bool(args.apply_registers),
                 "home_reference_note": "run this script with the arm already placed at the desired home pose",
-                "multi_turn_note": "multi-turn joints record home_wrapped_raw and relative continuous raw limits; automatic limit seeking uses step mode for motion and position mode for feedback",
                 "thresholds": {
                     "velocity_abs_threshold": float(args.velocity_abs_threshold),
                     "movement_abs_threshold": int(args.movement_abs_threshold),
@@ -652,8 +536,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Automatically calibrate soarmMoce from the current home pose. "
-            "Place the arm at the desired home pose before running. "
-            "Multi-turn joints store home_wrapped_raw plus relative continuous raw limits."
+            "Place the arm at the desired home pose before running."
         )
     )
     parser.add_argument("--joints", type=_parse_joints, default=list(JOINTS), help="Comma-separated joints to calibrate")
