@@ -33,11 +33,11 @@ _DEFAULT_JOINT_ALIASES = {
     "wrist_roll": "wrist_roll",
 }
 _DEFAULT_HOME_DEG = {
-    "shoulder_pan": 2.32967032967033,
+    "shoulder_pan": 0.0,
     "shoulder_lift": 0.0,
     "elbow_flex": 0.0,
-    "wrist_flex": 74.98901098901099,
-    "wrist_roll": 6.945054945054945,
+    "wrist_flex": 0.0,
+    "wrist_roll": 0.0,
 }
 _DEFAULT_GUI_ROTVEC_TO_JOINT = {
     "wrist_roll": [0.0, 0.0, 1.0],
@@ -509,22 +509,9 @@ class Robot:
         return [str(name) for name in raw if str(name) in self.robot_model.joint_name_to_index]
 
     def _resolve_home_q(self) -> np.ndarray:
-        home_cfg = self.config.get("home", {}) if isinstance(self.config, dict) else {}
-        joints = home_cfg.get("joints") or home_cfg.get("joints_deg") or home_cfg.get("q")
-        if isinstance(joints, dict):
-            q_deg = np.array([_DEFAULT_HOME_DEG.get(name, 0.0) for name in self.robot_model.joint_names], dtype=float)
-            for idx, name in enumerate(self.robot_model.joint_names):
-                if name in joints:
-                    q_deg[idx] = float(joints[name])
-            return np.deg2rad(q_deg)
-        if joints is None:
-            return np.deg2rad(np.array([_DEFAULT_HOME_DEG.get(name, 0.0) for name in self.robot_model.joint_names], dtype=float))
-        q = np.asarray(joints, dtype=float).reshape(-1)
-        if q.shape[0] != self.robot_model.dof:
-            raise ValueError(f"Home joint count mismatch: expected {self.robot_model.dof}, got {q.shape[0]}")
-        if np.max(np.abs(q)) > 2.0 * np.pi:
-            return np.deg2rad(q)
-        return q
+        return np.deg2rad(
+            np.array([_DEFAULT_HOME_DEG.get(name, 0.0) for name in self.robot_model.joint_names], dtype=float)
+        )
 
     def _check_limits(self, q: np.ndarray) -> None:
         lower = np.array([l for l, _ in self.robot_model.joint_limits], dtype=float)

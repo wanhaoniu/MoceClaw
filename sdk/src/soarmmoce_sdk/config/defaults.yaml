@@ -4,7 +4,7 @@ transport:
   baudrate: 115200
   host: 192.168.66.130
   timeout: 2.0
-  robot_id: follower_moce
+  robot_id: soarmmoce
   calibration_path: ""
   arm_p_coefficient: 16
   arm_d_coefficient: 8
@@ -29,16 +29,16 @@ robot:
     wrist_flex: wrist
     wrist_roll: wrist_roll
   joint_scales:
-    shoulder_pan: 1.0
-    shoulder_lift: 5.3
-    elbow_flex: -5.6
+    shoulder_pan: -1.0
+    shoulder_lift: -5.3
+    elbow_flex: 5.6
     wrist_flex: 1.0
     wrist_roll: 1.0
   sim_joint_offsets_deg:
     shoulder_lift: 0.0
     wrist_flex: 0.0
   multi_turn_joints: [shoulder_lift, elbow_flex]
-  cartesian_locked_joints: [wrist_roll]
+  cartesian_locked_joints: [wrist_flex, wrist_roll]
   gui_rotvec_to_joint:
     wrist_roll: [0.0, 0.0, 1.0]
 
@@ -59,14 +59,6 @@ ik:
   max_step_rad: 0.15
   seed_bias: 0.02
   max_pos_error_m: 0.03
-
-home:
-  joints_deg:
-    shoulder_pan: 2.32967032967033
-    shoulder_lift: 0.0
-    elbow_flex: 0.0
-    wrist_flex: 74.98901098901099
-    wrist_roll: 6.945054945054945
 
 permissions:
   allow_motion: true

@@ -9,25 +9,26 @@ from typing import Any, Dict
 
 import draccus
 from lerobot.motors import Motor, MotorNormMode
-from lerobot.motors.feetech import FeetechMotorsBus
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.utils.utils import enter_pressed, move_cursor_up
 
 from soarmmoce_auto_calibrate import (
     DEFAULT_CONNECT_TIMEOUT_S,
-    FULL_SPAN_SINGLE_TURN_JOINTS,
     MultiTurnTrackerState,
     _build_multi_turn_calibration_entry,
-    _desired_home_present_raw,
+    _build_single_turn_calibration_entry,
     _parse_joints,
     _read_joint_snapshot,
     _read_json,
+    _single_turn_zero_present_raw,
     _write_json,
 )
 from soarmmoce_cli_common import run_and_print
-from soarmmoce_sdk import JOINTS, MULTI_TURN_JOINTS, SoArmMoceConfig, SoArmMoceController, resolve_config
+from soarmmoce_sdk import JOINTS, MULTI_TURN_JOINTS, SoArmMoceConfig, resolve_config
 
 
 SUPPORTED_ROBOT_TYPES = {"soarmmoce"}
+CALIBRATION_META_KEY = "_meta"
 
 
 class _ManualConnectTimeout(RuntimeError):
@@ -216,10 +217,9 @@ def _resolve_runtime_context(robot_cfg: ManualCalibrateRobotConfig) -> Dict[str,
 
 def _capture_home_pose(
     *,
-    arm: SoArmMoceController,
     bus,
     joints: list[str],
-    current_hw_calib,
+    raw_offset_correction: Dict[str, int],
     poll_interval_s: float,
     display_values: bool,
 ) -> tuple[Dict[str, int], Dict[str, int], Dict[str, int], Dict[str, MultiTurnTrackerState]]:
@@ -231,7 +231,12 @@ def _capture_home_pose(
 
     while not captured:
         for joint in joints:
-            snap = _read_joint_snapshot(bus, joint, tracker=tracker)
+            snap = _read_joint_snapshot(
+                bus,
+                joint,
+                tracker=tracker,
+                homing_offset_raw=int(raw_offset_correction.get(joint, 0)),
+            )
             home_present_raw[joint] = int(snap["position"])
             home_present_wrapped_raw[joint] = int(snap["position_wrapped"])
             if joint in MULTI_TURN_JOINTS:
@@ -239,42 +244,21 @@ def _capture_home_pose(
             else:
                 model = bus.motors[joint].model
                 max_res = int(bus.model_resolution_table[model] - 1)
-                motor_home_deg = arm._joint_to_motor_deg(
-                    joint,
-                    float(arm.config.home_joints.get(joint, 0.0)),
-                )
-                desired_home_raw[joint] = int(_desired_home_present_raw(max_res, motor_home_deg))
+                desired_home_raw[joint] = int(_single_turn_zero_present_raw(max_res))
 
         if display_values:
             print(
-                "\n------------------------------------------------------------------------------------------------"
+                "\nThis step captures zero references only. Joint limits are recorded in the next step."
             )
             print(
-                f"{'NAME':<15} | {'HOME_RAW':>10} | {'WRAPPED':>8} | {'REF':>8} | "
-                f"{'CUR_OFF':>8} | {'NEW_OFF':>8} | {'RAW_WINDOW':>13} | {'STATUS':>10}"
+                f"{'NAME':<15} | {'ACTUAL_RAW':>10} | {'WRAPPED':>8} | {'ZERO_REF':>10} | {'MODE':>12}"
             )
             for joint in joints:
-                if joint in MULTI_TURN_JOINTS:
-                    current_offset = "-"
-                    new_offset = "-"
-                    raw_window = "software_zero"
-                    status = "multi_turn"
-                else:
-                    diag = _single_turn_home_offset_diag(
-                        bus=bus,
-                        joint=joint,
-                        home_raw=home_present_raw[joint],
-                        desired_home_raw=desired_home_raw[joint],
-                        current_hw_calib=current_hw_calib,
-                    )
-                    current_offset = str(diag["current_offset"])
-                    new_offset = str(diag["new_offset"])
-                    raw_window = _format_raw_window(diag["feasible_low_raw"], diag["feasible_high_raw"])
-                    status = _format_home_status(diag)
+                mode = "soft_zero" if joint in MULTI_TURN_JOINTS else "half_turn"
+                zero_ref = "current" if joint in MULTI_TURN_JOINTS else str(desired_home_raw[joint])
                 print(
                     f"{joint:<15} | {home_present_raw[joint]:>10} | "
-                    f"{home_present_wrapped_raw[joint]:>8} | {desired_home_raw[joint]:>8} | "
-                    f"{current_offset:>8} | {new_offset:>8} | {raw_window:>13} | {status:>10}"
+                    f"{home_present_wrapped_raw[joint]:>8} | {zero_ref:>10} | {mode:>12}"
                 )
 
         if enter_pressed():
@@ -287,26 +271,57 @@ def _capture_home_pose(
     return home_present_raw, home_present_wrapped_raw, desired_home_raw, tracker
 
 
+def _prepare_multi_turn_joints_for_calibration(bus, joints: list[str]) -> None:
+    for joint in joints:
+        model = bus.motors[joint].model
+        max_res = int(bus.model_resolution_table[model] - 1)
+        bus.write("Homing_Offset", joint, 0, normalize=False)
+        bus.write("Min_Position_Limit", joint, 0, normalize=False)
+        bus.write("Max_Position_Limit", joint, max_res, normalize=False)
+        bus.write("Operating_Mode", joint, OperatingMode.POSITION.value, normalize=False)
+    if joints:
+        time.sleep(0.05)
+
+
 def _record_manual_ranges(
     *,
     bus,
     joints: list[str],
+    raw_offset_correction: Dict[str, int],
     poll_interval_s: float,
     display_values: bool,
     tracker: Dict[str, MultiTurnTrackerState] | None = None,
-    allow_static_joints: set[str] | None = None,
 ) -> tuple[Dict[str, int], Dict[str, int]]:
     if not joints:
         return {}, {}
-    allow_static_joints = set(allow_static_joints or set())
 
-    positions = {joint: int(_read_joint_snapshot(bus, joint, tracker=tracker)["position"]) for joint in joints}
+    positions = {
+        joint: int(
+            _read_joint_snapshot(
+                bus,
+                joint,
+                tracker=tracker,
+                homing_offset_raw=int(raw_offset_correction.get(joint, 0)),
+            )["position"]
+        )
+        for joint in joints
+    }
     mins = dict(positions)
     maxes = dict(positions)
     user_pressed_enter = False
 
     while not user_pressed_enter:
-        positions = {joint: int(_read_joint_snapshot(bus, joint, tracker=tracker)["position"]) for joint in joints}
+        positions = {
+            joint: int(
+                _read_joint_snapshot(
+                    bus,
+                    joint,
+                    tracker=tracker,
+                    homing_offset_raw=int(raw_offset_correction.get(joint, 0)),
+                )["position"]
+            )
+            for joint in joints
+        }
         mins = {joint: min(mins[joint], positions[joint]) for joint in joints}
         maxes = {joint: max(maxes[joint], positions[joint]) for joint in joints}
 
@@ -323,7 +338,7 @@ def _record_manual_ranges(
             if display_values:
                 move_cursor_up(len(joints) + 3)
 
-    same_min_max = [joint for joint in joints if mins[joint] == maxes[joint] and joint not in allow_static_joints]
+    same_min_max = [joint for joint in joints if mins[joint] == maxes[joint]]
     if same_min_max:
         raise ValueError(
             "Some joints did not move during manual range recording: "
@@ -341,173 +356,6 @@ def _apply_selected_calibration(bus, joints: list[str], payload: Dict[str, Any])
         bus.write("Homing_Offset", joint, int(entry["homing_offset"]), normalize=False)
         bus.write("Min_Position_Limit", joint, int(entry["range_min"]), normalize=False)
         bus.write("Max_Position_Limit", joint, int(entry["range_max"]), normalize=False)
-
-
-def _single_turn_home_offset_diag(
-    *,
-    bus,
-    joint: str,
-    home_raw: int,
-    desired_home_raw: int,
-    current_hw_calib,
-) -> Dict[str, int | bool]:
-    model = bus.motors[joint].model
-    max_res = int(bus.model_resolution_table[model] - 1)
-    current_offset = int(current_hw_calib[joint].homing_offset)
-    home_raw = int(home_raw)
-    desired_home = int(desired_home_raw)
-    new_offset = int(round(current_offset + home_raw - desired_home))
-    feasible_low_raw = int(max(0, desired_home - current_offset - 2047))
-    feasible_high_raw = int(min(max_res, desired_home - current_offset + 2047))
-    return {
-        "current_offset": int(current_offset),
-        "new_offset": int(new_offset),
-        "feasible_low_raw": int(feasible_low_raw),
-        "feasible_high_raw": int(feasible_high_raw),
-        "within_limits": bool(feasible_low_raw <= home_raw <= feasible_high_raw),
-        "raw_delta_to_window": int(
-            feasible_low_raw - home_raw if home_raw < feasible_low_raw else home_raw - feasible_high_raw
-        )
-        if home_raw < feasible_low_raw or home_raw > feasible_high_raw
-        else 0,
-    }
-
-
-def _format_raw_window(low_raw: int, high_raw: int) -> str:
-    return f"{int(low_raw)}..{int(high_raw)}"
-
-
-def _format_home_status(diag: Dict[str, int | bool]) -> str:
-    if bool(diag["within_limits"]):
-        return "OK"
-    delta = int(diag["raw_delta_to_window"])
-    if int(diag["new_offset"]) < -2047:
-        return f"LOW+{delta}"
-    return f"HIGH-{delta}"
-
-
-def _single_turn_range_diag(
-    *,
-    bus,
-    joint: str,
-    home_raw: int,
-    desired_home_raw: int,
-    observed_min_raw: int,
-    observed_max_raw: int,
-) -> Dict[str, int | bool]:
-    model = bus.motors[joint].model
-    max_res = int(bus.model_resolution_table[model] - 1)
-    home_raw = int(home_raw)
-    desired_home = int(desired_home_raw)
-    observed_min_raw = int(observed_min_raw)
-    observed_max_raw = int(observed_max_raw)
-    new_min = int(round(observed_min_raw - home_raw + desired_home))
-    new_max = int(round(observed_max_raw - home_raw + desired_home))
-    feasible_low_raw = int(max(0, observed_max_raw + desired_home - max_res))
-    feasible_high_raw = int(min(max_res, observed_min_raw + desired_home))
-    return {
-        "new_min": int(new_min),
-        "new_max": int(new_max),
-        "feasible_low_raw": int(feasible_low_raw),
-        "feasible_high_raw": int(feasible_high_raw),
-        "within_limits": bool(0 <= new_min < new_max <= max_res),
-        "raw_delta_to_window": int(
-            feasible_low_raw - home_raw if home_raw < feasible_low_raw else home_raw - feasible_high_raw
-        )
-        if home_raw < feasible_low_raw or home_raw > feasible_high_raw
-        else 0,
-    }
-
-
-def _format_range_status(diag: Dict[str, int | bool]) -> str:
-    if bool(diag["within_limits"]):
-        return "OK"
-    delta = int(diag["raw_delta_to_window"])
-    if int(diag["new_min"]) < 0:
-        return f"HIGH-{delta}"
-    return f"LOW+{delta}"
-
-
-def _validate_home_pose_offsets(
-    *,
-    bus,
-    joints: list[str],
-    home_present_raw: Dict[str, int],
-    desired_home_raw: Dict[str, int],
-    current_hw_calib,
-) -> None:
-    violations = []
-    for joint in joints:
-        current_offset = int(current_hw_calib[joint].homing_offset)
-        desired_home = int(desired_home_raw[joint])
-        home_raw = int(home_present_raw[joint])
-        if joint in MULTI_TURN_JOINTS:
-            continue
-
-        diag = _single_turn_home_offset_diag(
-            bus=bus,
-            joint=joint,
-            home_raw=home_raw,
-            desired_home_raw=desired_home,
-            current_hw_calib=current_hw_calib,
-        )
-        new_offset = int(diag["new_offset"])
-        if not bool(diag["within_limits"]):
-            violations.append(
-                f"{joint}: home_raw={home_raw}, desired_home_raw={desired_home}, current_offset={current_offset}, "
-                f"new_offset={new_offset}, feasible_home_raw_range=[{diag['feasible_low_raw']}, {diag['feasible_high_raw']}], "
-                f"status={_format_home_status(diag)}"
-            )
-
-    if violations:
-        raise ValueError(
-            "The selected home pose would push Homing_Offset outside the Feetech +/-2047 limit. "
-            "Adjust the home pose for these joints and retry:\n"
-            + "\n".join(violations)
-        )
-
-
-def _validate_single_turn_recorded_ranges(
-    *,
-    bus,
-    joints: list[str],
-    home_present_raw: Dict[str, int],
-    desired_home_raw: Dict[str, int],
-    min_present_raw: Dict[str, int],
-    max_present_raw: Dict[str, int],
-) -> None:
-    violations = []
-    for joint in joints:
-        if joint in MULTI_TURN_JOINTS:
-            continue
-        if joint in FULL_SPAN_SINGLE_TURN_JOINTS:
-            continue
-        home_raw = int(home_present_raw[joint])
-        desired_home = int(desired_home_raw[joint])
-        observed_min = int(min_present_raw[joint])
-        observed_max = int(max_present_raw[joint])
-        diag = _single_turn_range_diag(
-            bus=bus,
-            joint=joint,
-            home_raw=home_raw,
-            desired_home_raw=desired_home,
-            observed_min_raw=observed_min,
-            observed_max_raw=observed_max,
-        )
-        if not bool(diag["within_limits"]):
-            violations.append(
-                f"{joint}: home_raw={home_raw}, observed_range=[{observed_min}, {observed_max}], "
-                f"translated_range=[{diag['new_min']}, {diag['new_max']}], "
-                f"feasible_home_raw_range_for_recorded_span=[{diag['feasible_low_raw']}, {diag['feasible_high_raw']}], "
-                f"status={_format_range_status(diag)}"
-            )
-
-    if violations:
-        raise ValueError(
-            "The recorded single-turn range would produce invalid Min/Max_Position_Limit values. "
-            "Adjust the home pose and/or reduce the recorded span for these joints and retry:\n"
-            + "\n".join(violations)
-        )
 
 
 def _confirm_multi_turn_home_capture(
@@ -547,7 +395,6 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
     seed_calib_json = target_calib_json or _read_json(runtime_calibration_path)
     calibration_seed_path = target_source_path if target_calib_json else runtime_calibration_path
 
-    arm = SoArmMoceController(runtime_config)
     bus = _connect_manual_calibration_bus(runtime_config.port)
     try:
         if target_calib_json and bool(robot_cfg.prompt_existing):
@@ -584,53 +431,49 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
         register_writes: Dict[str, Dict[str, Any]] = {}
         results: Dict[str, Dict[str, Any]] = {}
         tracker: Dict[str, MultiTurnTrackerState] = {}
+        raw_offset_correction = {joint: int(current_hw_calib[joint].homing_offset) for joint in joints}
+        single_turn_homing_offsets: Dict[str, int] = {}
+
+        _prepare_multi_turn_joints_for_calibration(bus, multi_turn_joints)
+        for joint in multi_turn_joints:
+            raw_offset_correction[joint] = 0
 
         print(
-            "Torque is disabled. Move the arm to the desired home pose. "
-            "Live values are shown below. Press ENTER to capture the current pose."
+            "Torque is disabled. Place single-turn joints at the URDF q=0 pose. "
+            "For multi-turn joints, the current pose becomes software zero. "
+            "Press ENTER to capture the current pose."
         )
         home_present_raw, home_present_wrapped_raw, desired_home_raw, tracker = _capture_home_pose(
-            arm=arm,
             bus=bus,
             joints=joints,
-            current_hw_calib=current_hw_calib,
+            raw_offset_correction=raw_offset_correction,
             poll_interval_s=float(robot_cfg.poll_interval_s),
             display_values=bool(robot_cfg.display_values),
         )
 
-        _validate_home_pose_offsets(
-            bus=bus,
-            joints=joints,
-            home_present_raw=home_present_raw,
-            desired_home_raw=desired_home_raw,
-            current_hw_calib=current_hw_calib,
-        )
         _confirm_multi_turn_home_capture(
             joints=multi_turn_joints,
             home_present_raw=home_present_raw,
         )
 
+        if single_turn_joints:
+            offsets = bus.set_half_turn_homings(single_turn_joints)
+            single_turn_homing_offsets = {str(joint): int(offset) for joint, offset in offsets.items()}
+
         if joints:
             print(
                 "Move the selected joints sequentially through their entire ranges of motion.\n"
+                "Single-turn joints are re-centered to 2047 before recording.\n"
                 "Multi-turn joints are tracked continuously from the captured home reference.\n"
                 "Recording positions with torque disabled. Press ENTER to stop..."
             )
             min_present_raw, max_present_raw = _record_manual_ranges(
                 bus=bus,
                 joints=joints,
+                raw_offset_correction={joint: 0 for joint in joints},
                 poll_interval_s=float(robot_cfg.poll_interval_s),
                 display_values=bool(robot_cfg.display_values),
                 tracker=tracker,
-                allow_static_joints=set(FULL_SPAN_SINGLE_TURN_JOINTS),
-            )
-            _validate_single_turn_recorded_ranges(
-                bus=bus,
-                joints=joints,
-                home_present_raw=home_present_raw,
-                desired_home_raw=desired_home_raw,
-                min_present_raw=min_present_raw,
-                max_present_raw=max_present_raw,
             )
 
         for joint in joints:
@@ -656,45 +499,27 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
                     "calibration_mode": str(result_payload["calibration_mode"]),
                 }
             else:
-                desired_home = int(desired_home_raw[joint])
                 model = bus.motors[joint].model
                 max_res = int(bus.model_resolution_table[model] - 1)
-                new_offset = int(
-                    round(int(current_cal.homing_offset) + int(home_present_raw[joint]) - int(desired_home))
+                entry, result_payload = _build_single_turn_calibration_entry(
+                    current_cal=current_cal,
+                    max_res=max_res,
+                    homing_offset_raw=int(single_turn_homing_offsets[joint]),
+                    min_present_raw=int(min_present_raw[joint]),
+                    max_present_raw=int(max_present_raw[joint]),
                 )
-                observed_min = int(min_present_raw[joint])
-                observed_max = int(max_present_raw[joint])
-                if joint in FULL_SPAN_SINGLE_TURN_JOINTS:
-                    new_min = 0
-                    new_max = int(max_res)
-                    calibration_mode = "manual_offset_only_full_span"
-                else:
-                    new_min = int(round(observed_min - int(home_present_raw[joint]) + int(desired_home)))
-                    new_max = int(round(observed_max - int(home_present_raw[joint]) + int(desired_home)))
-                    if new_min >= new_max:
-                        raise RuntimeError(f"Invalid calibration span for {joint}: min={new_min}, max={new_max}")
-                    calibration_mode = "manual_range_recording"
                 results[joint] = {
-                    "calibration_mode": calibration_mode,
-                    "home_present_raw": int(home_present_raw[joint]),
+                    **result_payload,
+                    "captured_zero_raw_before_half_turn": int(home_present_raw[joint]),
                     "home_present_wrapped_raw": int(home_present_wrapped_raw[joint]),
-                    "desired_home_present_raw": int(desired_home),
-                    "observed_range_min_raw": int(observed_min),
-                    "observed_range_max_raw": int(observed_max),
                 }
-                written_json[joint] = {
-                    "id": int(current_cal.id),
-                    "drive_mode": int(current_cal.drive_mode),
-                    "homing_offset": int(new_offset),
-                    "range_min": int(new_min),
-                    "range_max": int(new_max),
-                }
+                written_json[joint] = entry
                 register_writes[joint] = {
-                    "homing_offset": int(new_offset),
-                    "range_min": int(new_min),
-                    "range_max": int(new_max),
-                    "desired_home_present_raw": int(desired_home),
-                    "calibration_mode": str(results[joint]["calibration_mode"]),
+                    "homing_offset": int(entry["homing_offset"]),
+                    "range_min": int(entry["range_min"]),
+                    "range_max": int(entry["range_max"]),
+                    "zero_present_raw": int(result_payload["zero_present_raw"]),
+                    "calibration_mode": str(result_payload["calibration_mode"]),
                 }
 
         if robot_cfg.apply_registers:
@@ -702,6 +527,9 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
             _apply_selected_calibration(bus, joints, written_json)
 
         if robot_cfg.save_json:
+            written_json[CALIBRATION_META_KEY] = {
+                "home_joint_deg": {joint: 0.0 for joint in JOINTS},
+            }
             _write_json(output_path, written_json)
 
         return {
@@ -717,8 +545,8 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
             "output_path": str(output_path),
             "saved_json": bool(robot_cfg.save_json),
             "applied_registers": bool(robot_cfg.apply_registers),
-            "home_reference_note": "run this script while the arm is manually placed at the desired home pose",
-            "single_turn_note": "single-turn joints use manual range recording with torque disabled",
+            "home_reference_note": "single-turn joints use the URDF q=0 pose; multi-turn joints use the captured pose as software zero",
+            "single_turn_note": "single-turn joints use the LeRobot half-turn zero plus manual range recording with torque disabled",
             "multi_turn_note": "multi-turn joints store home_wrapped_raw plus relative continuous raw limits recorded with software unwrap in position mode",
             "results": results,
             "register_writes": register_writes,

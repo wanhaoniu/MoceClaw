@@ -225,11 +225,11 @@ class ArmControlGUI(QMainWindow):
         self._sdk_gui_sync_enabled = str(os.getenv("SOARMMOCE_GUI_SYNC", "1")).strip().lower() not in ("0", "false", "off", "no")
         try:
             self._sdk_gui_sync_interval_sec = max(
-                0.1,
-                float(str(os.getenv("SOARMMOCE_GUI_SYNC_INTERVAL", "0.25")).strip()),
+                0.05,
+                float(str(os.getenv("SOARMMOCE_GUI_SYNC_INTERVAL", "0.10")).strip()),
             )
         except Exception:
-            self._sdk_gui_sync_interval_sec = 0.25
+            self._sdk_gui_sync_interval_sec = 0.10
         self._sdk_auto_home_on_start = str(os.getenv("SOARMMOCE_AUTO_HOME_ON_START", "1")).strip().lower() not in (
             "0",
             "false",
@@ -1194,7 +1194,7 @@ class ArmControlGUI(QMainWindow):
 
     def _on_sdk_sync_state_ready(self, state: object):
         if self._sim_motion_active:
-            return
+            self._cancel_sim_motion()
         self._sync_sim_from_sdk_state(state)
         self._sdk_last_gui_sync_ts = time.time()
         self._update_quick_pose_from_sim()
@@ -2067,21 +2067,10 @@ class ArmControlGUI(QMainWindow):
         self._apply_sim_joint_q(q_now, update_plot=True)
 
     def _handle_sim_motion_from_command(self, state: object, command: object, source: str):
-        src = str(source or "").strip()
-        if src == "stop":
-            self._cancel_sim_motion()
-            self._sync_sim_from_sdk_state(state)
-            return
-        command_dict = command if isinstance(command, dict) else {}
-        try:
-            duration = float(command_dict.get("duration", 0.0))
-        except Exception:
-            duration = 0.0
-        q_target = self._extract_joint_q_from_sdk_state(state, prefer_twin=True)
-        if q_target is None:
-            self._sync_sim_from_sdk_state(state)
-            return
-        self._schedule_sim_motion(q_target, duration)
+        # Treat hardware feedback as ground truth. The previous twin-based animation
+        # could diverge from the real arm during multi-turn lag or transport errors.
+        self._cancel_sim_motion()
+        self._sync_sim_from_sdk_state(state)
 
     def _sync_sim_from_sdk_state(self, state: object):
         q_src = self._extract_joint_q_from_sdk_state(state, prefer_twin=False)
@@ -2102,7 +2091,9 @@ class ArmControlGUI(QMainWindow):
         if not self._sdk_lock.acquire(blocking=False):
             return False
         try:
-            robot = self._sdk_get_robot()
+            robot = self._sdk_robot
+            if robot is None or not getattr(robot, "connected", False):
+                return False
             state = robot.get_state()
         except Exception as exc:
             if now - float(self._sdk_last_gui_sync_err_ts) >= 5.0:
@@ -2127,7 +2118,9 @@ class ArmControlGUI(QMainWindow):
                 continue
             state = None
             try:
-                robot = self._sdk_get_robot()
+                robot = self._sdk_robot
+                if robot is None or not getattr(robot, "connected", False):
+                    continue
                 state = robot.get_state()
             except Exception as exc:
                 now = time.time()

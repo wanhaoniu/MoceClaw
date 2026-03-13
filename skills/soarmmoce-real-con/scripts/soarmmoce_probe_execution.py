@@ -59,7 +59,19 @@ def _trace_last_joint_target_deg(trace: Optional[Dict[str, object]]) -> Optional
         payload = last_step.get("ik_target_joint_deg")
     if not isinstance(payload, dict):
         return None
-    return np.array([float(payload[name]) for name in ARM_JOINTS], dtype=float)
+    before_payload = last_step.get("before_joint_deg")
+    if not isinstance(before_payload, dict):
+        before_payload = {}
+    resolved = []
+    for name in ARM_JOINTS:
+        if name in payload and isinstance(payload[name], (int, float)):
+            resolved.append(float(payload[name]))
+            continue
+        if name in before_payload and isinstance(before_payload[name], (int, float)):
+            resolved.append(float(before_payload[name]))
+            continue
+        return None
+    return np.array(resolved, dtype=float)
 
 
 def _trace_last_ik_err_mm(trace: Optional[Dict[str, object]]) -> Optional[float]:

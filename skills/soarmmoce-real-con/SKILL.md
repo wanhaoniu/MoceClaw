@@ -155,7 +155,6 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 - `SOARMMOCE_CALIB_DIR`：标定目录
 - `SOARMMOCE_URDF_PATH`：URDF 路径，默认优先使用 `sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf`
 - `SOARMMOCE_TARGET_FRAME`：末端 frame，默认 `wrist_roll`（按当前 5DOF 链截断）
-- `SOARMMOCE_HOME_JOINTS_JSON`：覆盖 home 目标关节
 - `SOARMMOCE_JOINT_SCALE_JSON`：覆盖关节减速比/方向，默认 `{"shoulder_pan":1.0,"shoulder_lift":5.3,"elbow_flex":-5.6,"wrist_flex":1.0,"wrist_roll":1.0}`
 - `SOARMMOCE_MODEL_OFFSETS_JSON`：覆盖 URDF 模型角度偏置，默认 `{"shoulder_pan":0.0,"shoulder_lift":0.0,"elbow_flex":0.0,"wrist_flex":0.0,"wrist_roll":0.0}`
 - `SOARMMOCE_LINEAR_STEP_M`：笛卡尔插值步长，默认 `0.01`

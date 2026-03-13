@@ -15,6 +15,7 @@ from .base import TransportBase
 REPO_ROOT = Path(__file__).resolve().parents[4]
 MULTI_TURN_RAW_RANGE = 900000
 RAW_COUNTS_PER_REV = 4096.0
+HALF_RAW_COUNTS_PER_REV = RAW_COUNTS_PER_REV / 2.0
 DEFAULT_MULTI_TURN_JOINTS = ("shoulder_lift", "elbow_flex")
 DEFAULT_MOTOR_IDS = {
     "shoulder_pan": 1,
@@ -44,6 +45,10 @@ def _smooth_fraction(fraction: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _single_turn_zero_present_raw() -> int:
+    return int((RAW_COUNTS_PER_REV - 1.0) / 2.0)
+
+
 def _load_calibration(path: Path):
     from lerobot.motors import MotorCalibration
 
@@ -66,12 +71,24 @@ def _load_calibration(path: Path):
 
 
 def _candidate_calibration_paths(robot_id: str) -> list[Path]:
-    return [
-        REPO_ROOT / "Software/Slave/calibration/robots/so101_follower" / f"{robot_id}.json",
-        REPO_ROOT / "Software/Master/calibration/robots/so101_follower" / f"{robot_id}.json",
-        Path.cwd() / "Software/Slave/calibration/robots/so101_follower" / f"{robot_id}.json",
-        Path.home() / "Code/SO-ARM-Moce/Software/Slave/calibration/robots/so101_follower" / f"{robot_id}.json",
-    ]
+    robot_ids = []
+    for candidate in ("soarmmoce", str(robot_id).strip(), "follower_moce"):
+        if candidate and candidate not in robot_ids:
+            robot_ids.append(candidate)
+    paths: list[Path] = []
+    for rid in robot_ids:
+        paths.extend(
+            [
+                REPO_ROOT / "skills/soarmmoce-real-con/calibration" / f"{rid}.json",
+                REPO_ROOT / "Software/Slave/calibration/robots/so101_follower" / f"{rid}.json",
+                REPO_ROOT / "Software/Master/calibration/robots/so101_follower" / f"{rid}.json",
+                Path.cwd() / "skills/soarmmoce-real-con/calibration" / f"{rid}.json",
+                Path.cwd() / "Software/Slave/calibration/robots/so101_follower" / f"{rid}.json",
+                Path.home() / "Code/SO-ARM-Moce/skills/soarmmoce-real-con/calibration" / f"{rid}.json",
+                Path.home() / "Code/SO-ARM-Moce/Software/Slave/calibration/robots/so101_follower" / f"{rid}.json",
+            ]
+        )
+    return paths
 
 
 class SerialTransport(TransportBase):
@@ -124,6 +141,7 @@ class SerialTransport(TransportBase):
         self._motion_version = 0
         self._pending_motion: Optional[tuple[Dict[str, float], float]] = None
         self._motion_thread: Optional[threading.Thread] = None
+        self._multi_turn_state: Dict[str, Dict[str, float]] = {}
 
     def connect(self) -> None:
         try:
@@ -153,7 +171,7 @@ class SerialTransport(TransportBase):
             motors["gripper"] = Motor(DEFAULT_MOTOR_IDS["gripper"], "sts3215", MotorNormMode.RANGE_0_100)
 
         bus = FeetechMotorsBus(port=self.port, motors=motors, calibration=calibration)
-        passthrough_ids = {bus.motors[name].id for name in self.multi_turn_joint_names if name in bus.motors}
+        passthrough_ids = {bus.motors[name].id for name in self.joint_names if name in bus.motors}
         bus._unnormalize = types.MethodType(_make_passthrough_unnormalize(bus._unnormalize, passthrough_ids), bus)
         with self._io_lock:
             bus.connect()
@@ -178,6 +196,7 @@ class SerialTransport(TransportBase):
             bus.enable_torque()
         self._bus = bus
         self._connected = True
+        self._prime_multi_turn_state_from_current_pose()
         self._start_motion_worker()
         self.stop()
 
@@ -193,6 +212,7 @@ class SerialTransport(TransportBase):
                     pass
         self._bus = None
         self._connected = False
+        self._multi_turn_state = {}
 
     def get_q(self) -> np.ndarray:
         joint_deg = self._read_joint_state_deg()
@@ -365,14 +385,70 @@ class SerialTransport(TransportBase):
         scale = float(self.joint_scales.get(joint_name, 1.0))
         return float(motor_deg) / scale
 
+    def _single_turn_present_raw_to_joint_deg(self, joint_name: str, raw_value: float) -> float:
+        zero_raw = float(_single_turn_zero_present_raw())
+        motor_deg = (float(raw_value) - zero_raw) * 360.0 / (RAW_COUNTS_PER_REV - 1.0)
+        return self._motor_to_joint_deg(joint_name, motor_deg)
+
+    def _joint_deg_to_single_turn_present_raw(self, joint_name: str, joint_deg: float) -> int:
+        zero_raw = float(_single_turn_zero_present_raw())
+        motor_deg = self._joint_to_motor_deg(joint_name, float(joint_deg))
+        raw_value = int(round(zero_raw + motor_deg * (RAW_COUNTS_PER_REV - 1.0) / 360.0))
+        bus = self._assert_bus()
+        calibration = getattr(bus, "calibration", {}) or {}
+        entry = calibration.get(joint_name)
+        if entry is not None:
+            raw_value = int(min(int(entry.range_max), max(int(entry.range_min), raw_value)))
+        return raw_value
+
+    def _prime_multi_turn_state_from_current_pose(self) -> None:
+        bus = self._assert_bus()
+        with self._io_lock:
+            raw_motor = bus.sync_read("Present_Position", normalize=False)
+        for name in self.multi_turn_joint_names:
+            raw_mod = float(raw_motor.get(name, 0.0) % RAW_COUNTS_PER_REV)
+            self._multi_turn_state[name] = {
+                "last_raw_mod": raw_mod,
+                "continuous_raw": 0.0,
+            }
+
+    def _unwrap_multi_turn_raw(self, joint_name: str, raw_value: float) -> float:
+        raw_scalar = float(raw_value)
+        raw_mod = float(raw_scalar % RAW_COUNTS_PER_REV)
+        state = self._multi_turn_state.get(joint_name)
+        if state is None:
+            continuous_raw = 0.0
+        else:
+            last_raw_mod = float(state["last_raw_mod"])
+            last_continuous_raw = float(state["continuous_raw"])
+            delta = raw_mod - last_raw_mod
+            if delta > HALF_RAW_COUNTS_PER_REV:
+                delta -= RAW_COUNTS_PER_REV
+            elif delta < -HALF_RAW_COUNTS_PER_REV:
+                delta += RAW_COUNTS_PER_REV
+            continuous_raw = last_continuous_raw + delta
+        self._multi_turn_state[joint_name] = {
+            "last_raw_mod": raw_mod,
+            "continuous_raw": continuous_raw,
+        }
+        return continuous_raw
+
+    def _multi_turn_raw_to_joint_deg(self, joint_name: str, raw_value: float) -> float:
+        continuous_raw = self._unwrap_multi_turn_raw(joint_name, raw_value)
+        motor_deg = continuous_raw * 360.0 / RAW_COUNTS_PER_REV
+        return self._motor_to_joint_deg(joint_name, motor_deg)
+
     def _read_joint_state_deg(self) -> Dict[str, float]:
         bus = self._assert_bus()
         with self._io_lock:
-            current_motor = bus.sync_read("Present_Position", self.joint_names)
-        return {
-            name: self._motor_to_joint_deg(name, float(current_motor.get(name, 0.0)))
-            for name in self.joint_names
-        }
+            raw_motor = bus.sync_read("Present_Position", normalize=False)
+        joints: Dict[str, float] = {}
+        for name in self.joint_names:
+            if name in self.multi_turn_joint_names:
+                joints[name] = self._multi_turn_raw_to_joint_deg(name, float(raw_motor.get(name, 0.0)))
+            else:
+                joints[name] = self._single_turn_present_raw_to_joint_deg(name, float(raw_motor.get(name, 0.0)))
+        return joints
 
     def _build_bus_command(self, target_joint_deg: Dict[str, float], current_joint_deg: Dict[str, float]) -> Dict[str, float]:
         cmd: Dict[str, float] = {}
@@ -384,7 +460,7 @@ class SerialTransport(TransportBase):
                 if raw_step != 0:
                     cmd[name] = float(raw_step)
             else:
-                cmd[name] = self._joint_to_motor_deg(name, float(target))
+                cmd[name] = float(self._joint_deg_to_single_turn_present_raw(name, float(target)))
         return cmd
 
     def _write_joint_targets_deg(self, target_joint_deg: Dict[str, float]) -> None:

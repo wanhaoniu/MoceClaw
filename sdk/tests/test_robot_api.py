@@ -30,7 +30,7 @@ def test_get_state_default_config():
     robot.disconnect()
 
 
-def test_home_uses_configured_pose():
+def test_home_uses_urdf_zero_pose():
     robot = Robot()
     robot.connect()
 
@@ -40,12 +40,7 @@ def test_home_uses_configured_pose():
     robot.move_joints(q_mid, duration=0.01)
 
     q_home = robot.home(duration=0.01)
-    expected = np.deg2rad(
-        np.array(
-            [2.32967032967033, 0.0, 0.0, 74.98901098901099, 6.945054945054945],
-            dtype=float,
-        )
-    )
+    expected = np.zeros(robot.robot_model.dof, dtype=float)
     assert np.allclose(q_home, expected)
     assert np.allclose(robot.get_joint_state().q, q_home)
 

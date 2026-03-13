@@ -27,7 +27,7 @@ from soarmmoce_sdk import (
 RAW_COUNTS_PER_REV = 4096
 HALF_RAW_COUNTS_PER_REV = RAW_COUNTS_PER_REV / 2.0
 DEFAULT_CONNECT_TIMEOUT_S = 8.0
-FULL_SPAN_SINGLE_TURN_JOINTS = ("shoulder_pan",)
+CALIBRATION_META_KEY = "_meta"
 
 
 @dataclass(slots=True)
@@ -112,12 +112,19 @@ def _unwrap_position_raw(joint: str, wrapped_raw: int, tracker: Dict[str, MultiT
     return int(state.continuous_raw)
 
 
-def _read_joint_snapshot(bus, joint: str, tracker: Dict[str, MultiTurnTrackerState] | None = None) -> Dict[str, Any]:
-    wrapped_raw = int(bus.read("Present_Position", joint, normalize=False))
+def _read_joint_snapshot(
+    bus,
+    joint: str,
+    tracker: Dict[str, MultiTurnTrackerState] | None = None,
+    homing_offset_raw: int = 0,
+) -> Dict[str, Any]:
+    register_raw = int(bus.read("Present_Position", joint, normalize=False))
+    wrapped_raw = _wrap_position_raw(register_raw + int(homing_offset_raw))
     position_key = _unwrap_position_raw(joint, wrapped_raw, tracker)
     return {
         "position": int(position_key),
         "position_wrapped": int(wrapped_raw),
+        "position_register_raw": int(register_raw),
         "velocity": float(bus.read("Present_Velocity", joint, normalize=False)),
         "moving": int(bus.read("Moving", joint, normalize=False)),
         "current": float(bus.read("Present_Current", joint, normalize=False)),
@@ -414,9 +421,49 @@ def _move_joint_back_to_target(
             )
 
 
-def _desired_home_present_raw(max_res: int, motor_home_deg: float) -> int:
-    half_turn = int(max_res / 2)
-    return int(round(half_turn + float(motor_home_deg) * float(max_res) / 360.0))
+def _single_turn_zero_present_raw(max_res: int) -> int:
+    return int(max_res / 2)
+
+
+def _build_single_turn_calibration_entry(
+    *,
+    current_cal,
+    max_res: int,
+    homing_offset_raw: int,
+    min_present_raw: int,
+    max_present_raw: int,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    zero_present_raw = _single_turn_zero_present_raw(max_res)
+    homing_offset_raw = int(homing_offset_raw)
+    min_present_raw = int(min_present_raw)
+    max_present_raw = int(max_present_raw)
+
+    if not -2047 <= homing_offset_raw <= 2047:
+        raise RuntimeError(
+            f"Invalid single-turn homing offset for motor {current_cal.id}: "
+            f"zero_raw={zero_present_raw}, homing_offset={homing_offset_raw}"
+        )
+    if not 0 <= min_present_raw < max_present_raw <= int(max_res):
+        raise RuntimeError(
+            f"Invalid single-turn range for motor {current_cal.id}: "
+            f"recorded_range=[{min_present_raw}, {max_present_raw}]"
+        )
+
+    entry = {
+        "id": int(current_cal.id),
+        "drive_mode": int(current_cal.drive_mode),
+        "homing_offset": int(homing_offset_raw),
+        "range_min": int(min_present_raw),
+        "range_max": int(max_present_raw),
+    }
+    result_payload = {
+        "calibration_mode": "single_turn_half_turn_zero",
+        "homing_offset": int(homing_offset_raw),
+        "zero_present_raw": int(zero_present_raw),
+        "observed_range_min_raw": int(min_present_raw),
+        "observed_range_max_raw": int(max_present_raw),
+    }
+    return entry, result_payload
 
 
 def _build_multi_turn_calibration_entry(
@@ -496,6 +543,17 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
             results: Dict[str, Any] = {}
             min_present_raw: Dict[str, int] = {}
             max_present_raw: Dict[str, int] = {}
+            single_turn_joints = [joint for joint in joints if joint not in MULTI_TURN_JOINTS]
+            single_turn_homing_offsets: Dict[str, int] = {}
+            seek_home_target_raw = dict(home_present_raw)
+
+            if single_turn_joints:
+                offsets = bus.set_half_turn_homings(single_turn_joints)
+                single_turn_homing_offsets = {str(joint): int(offset) for joint, offset in offsets.items()}
+                for joint in single_turn_joints:
+                    model = bus.motors[joint].model
+                    max_res = int(bus.model_resolution_table[model] - 1)
+                    seek_home_target_raw[joint] = int(_single_turn_zero_present_raw(max_res))
 
             for joint in joints:
                 step_raw = int(args.multi_turn_step_raw if joint in MULTI_TURN_JOINTS else args.single_turn_step_raw)
@@ -517,7 +575,7 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                 back_from_neg = _move_joint_back_to_target(
                     bus=bus,
                     joint=joint,
-                    target_present_raw=int(home_present_raw[joint]),
+                    target_present_raw=int(seek_home_target_raw[joint]),
                     step_raw=step_raw,
                     poll_interval_s=args.poll_interval_s,
                     timeout_s=max(args.timeout_s, 2.0),
@@ -542,7 +600,7 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                 back_from_pos = _move_joint_back_to_target(
                     bus=bus,
                     joint=joint,
-                    target_present_raw=int(home_present_raw[joint]),
+                    target_present_raw=int(seek_home_target_raw[joint]),
                     step_raw=step_raw,
                     poll_interval_s=args.poll_interval_s,
                     timeout_s=max(args.timeout_s, 2.0),
@@ -586,33 +644,21 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
 
                 model = bus.motors[joint].model
                 max_res = int(bus.model_resolution_table[model] - 1)
-                motor_home_deg = arm._joint_to_motor_deg(joint, float(config.home_joints.get(joint, 0.0)))
-                desired_home = _desired_home_present_raw(max_res, motor_home_deg)
-                new_offset = int(round(int(current_cal.homing_offset) + int(home_present_raw[joint]) - desired_home))
-                if joint in FULL_SPAN_SINGLE_TURN_JOINTS:
-                    new_min = 0
-                    new_max = int(max_res)
-                    calibration_mode = "single_turn_offset_only_full_span"
-                else:
-                    new_min = int(round(int(min_present_raw[joint]) - int(home_present_raw[joint]) + desired_home))
-                    new_max = int(round(int(max_present_raw[joint]) - int(home_present_raw[joint]) + desired_home))
-                    if new_min >= new_max:
-                        raise RuntimeError(f"Invalid calibration span for {joint}: min={new_min}, max={new_max}")
-                    calibration_mode = "single_turn_seek_limits"
-
-                written_json[joint] = {
-                    "id": int(current_cal.id),
-                    "drive_mode": int(current_cal.drive_mode),
-                    "homing_offset": int(new_offset),
-                    "range_min": int(new_min),
-                    "range_max": int(new_max),
-                }
+                entry, result_payload = _build_single_turn_calibration_entry(
+                    current_cal=current_cal,
+                    max_res=max_res,
+                    homing_offset_raw=int(single_turn_homing_offsets[joint]),
+                    min_present_raw=int(min_present_raw[joint]),
+                    max_present_raw=int(max_present_raw[joint]),
+                )
+                written_json[joint] = entry
+                results[joint]["calibration"] = result_payload
                 register_writes[joint] = {
-                    "homing_offset": int(new_offset),
-                    "range_min": int(new_min),
-                    "range_max": int(new_max),
-                    "desired_home_present_raw": int(desired_home),
-                    "calibration_mode": calibration_mode,
+                    "homing_offset": int(entry["homing_offset"]),
+                    "range_min": int(entry["range_min"]),
+                    "range_max": int(entry["range_max"]),
+                    "zero_present_raw": int(result_payload["zero_present_raw"]),
+                    "calibration_mode": str(result_payload["calibration_mode"]),
                 }
 
             if args.apply_registers:
@@ -623,6 +669,9 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                     bus.write("Max_Position_Limit", joint, int(write_spec["range_max"]), normalize=False)
 
             if args.save_json:
+                written_json[CALIBRATION_META_KEY] = {
+                    "home_joint_deg": {joint: 0.0 for joint in JOINTS},
+                }
                 _write_json(output_path, written_json)
 
             return {
@@ -633,7 +682,7 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                 "output_path": str(output_path),
                 "saved_json": bool(args.save_json),
                 "applied_registers": bool(args.apply_registers),
-                "home_reference_note": "run this script with the arm already placed at the desired home pose",
+                "home_reference_note": "place single-turn joints at the URDF q=0 pose before running; multi-turn joints use the current pose as software zero",
                 "thresholds": {
                     "velocity_abs_threshold": float(args.velocity_abs_threshold),
                     "movement_abs_threshold": int(args.movement_abs_threshold),
@@ -657,8 +706,8 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Automatically calibrate soarmMoce from the current home pose. "
-            "Place the arm at the desired home pose before running."
+            "Automatically calibrate soarmMoce from the current zero pose. "
+            "Single-turn joints use URDF q=0; multi-turn joints use the current pose as software zero."
         )
     )
     parser.add_argument("--joints", type=_parse_joints, default=list(JOINTS), help="Comma-separated joints to calibrate")
