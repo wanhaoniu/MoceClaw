@@ -246,6 +246,7 @@ class ArmControlGUI(QMainWindow):
         self._sdk_auto_home_done = False
         self._sdk_last_gui_sync_ts = 0.0
         self._sdk_last_gui_sync_err_ts = 0.0
+        self._sdk_visual_prefer_twin_until_ts = 0.0
         self._sdk_cmd_queue = deque()
         self._sdk_cmd_cond = threading.Condition()
         self._sdk_cmd_running = True
@@ -2061,14 +2062,29 @@ class ArmControlGUI(QMainWindow):
             and duration > 1e-4
             and np.linalg.norm(np.asarray(q_target, dtype=float) - np.asarray(q_actual, dtype=float)) > 1e-5
         ):
+            self._sdk_visual_prefer_twin_until_ts = time.time() + duration + 0.5
             self._schedule_sim_motion(np.asarray(q_target, dtype=float), duration)
             return
 
+        self._sdk_visual_prefer_twin_until_ts = 0.0
         self._cancel_sim_motion()
         self._sync_sim_from_sdk_state(state)
 
+    def _resolve_display_joint_q_from_sdk_state(self, state: object) -> Optional[np.ndarray]:
+        q_actual = self._extract_joint_q_from_sdk_state(state, prefer_twin=False)
+        q_twin = self._extract_joint_q_from_sdk_state(state, prefer_twin=True)
+        if q_actual is None:
+            return q_twin
+        if q_twin is None:
+            return q_actual
+        if np.linalg.norm(np.asarray(q_twin, dtype=float) - np.asarray(q_actual, dtype=float)) <= 1e-5:
+            return q_actual
+        if time.time() < float(self._sdk_visual_prefer_twin_until_ts):
+            return q_twin
+        return q_actual
+
     def _sync_sim_from_sdk_state(self, state: object):
-        q_src = self._extract_joint_q_from_sdk_state(state, prefer_twin=False)
+        q_src = self._resolve_display_joint_q_from_sdk_state(state)
         if q_src is None:
             return
         self._apply_sim_joint_q(q_src, update_plot=True)
