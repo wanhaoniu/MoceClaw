@@ -225,11 +225,11 @@ class ArmControlGUI(QMainWindow):
         self._sdk_gui_sync_enabled = str(os.getenv("SOARMMOCE_GUI_SYNC", "1")).strip().lower() not in ("0", "false", "off", "no")
         try:
             self._sdk_gui_sync_interval_sec = max(
-                0.05,
-                float(str(os.getenv("SOARMMOCE_GUI_SYNC_INTERVAL", "0.10")).strip()),
+                0.02,
+                float(str(os.getenv("SOARMMOCE_GUI_SYNC_INTERVAL", "0.04")).strip()),
             )
         except Exception:
-            self._sdk_gui_sync_interval_sec = 0.10
+            self._sdk_gui_sync_interval_sec = 0.04
         self._sdk_auto_home_on_start = str(os.getenv("SOARMMOCE_AUTO_HOME_ON_START", "1")).strip().lower() not in (
             "0",
             "false",
@@ -1121,7 +1121,7 @@ class ArmControlGUI(QMainWindow):
         with self._sdk_lock:
             robot = self._sdk_get_robot()
             state_before = robot.get_state()
-            pose_now = self._extract_tcp_pose_from_sdk_state(state_before, prefer_twin=True)
+            pose_now = self._extract_tcp_pose_from_sdk_state(state_before, prefer_twin=False)
             if pose_now is None:
                 xyz_now = np.asarray(state_before.tcp_pose.xyz, dtype=float)
                 rpy_now = np.asarray(state_before.tcp_pose.rpy, dtype=float)
@@ -1135,13 +1135,21 @@ class ArmControlGUI(QMainWindow):
             else:
                 target_xyz = np.asarray(xyz_now, dtype=float) + delta_pos_local
                 R_target = self._rotvec_to_rotmat(delta_rot_local) @ R_now
-            target_rpy = self._rotmat_to_rpy(R_target)
-            robot.move_pose(
-                xyz=target_xyz,
-                rpy=target_rpy,
-                duration=duration,
-                wait=False,
-            )
+            if key_norm in trans_map:
+                robot.move_pose(
+                    xyz=target_xyz,
+                    rpy=None,
+                    duration=duration,
+                    wait=False,
+                )
+            else:
+                target_rpy = self._rotmat_to_rpy(R_target)
+                robot.move_pose(
+                    xyz=target_xyz,
+                    rpy=target_rpy,
+                    duration=duration,
+                    wait=False,
+                )
             return robot.get_state()
 
     def _execute_sdk_home(self, command: Dict[str, Any]) -> object:
@@ -1898,38 +1906,9 @@ class ArmControlGUI(QMainWindow):
             return None
 
     def _resolve_sim_joint_offsets(self, joint_names: List[str]) -> np.ndarray:
-        offsets = np.zeros(len(joint_names), dtype=float)
-        if not SDK_AVAILABLE or RuntimeRobot is None or not joint_names:
-            return offsets
-        try:
-            robot = RuntimeRobot.from_config(self._sdk_config_path) if self._sdk_config_path else RuntimeRobot()
-            robot_cfg = robot.config.get("robot", {}) if isinstance(robot.config, dict) else {}
-            alias_cfg = robot_cfg.get("joint_name_aliases", {}) if isinstance(robot_cfg, dict) else {}
-            raw_deg = robot_cfg.get("sim_joint_offsets_deg") or {}
-            raw_rad = robot_cfg.get("sim_joint_offsets") or robot_cfg.get("sim_joint_offsets_rad") or {}
-            for sim_idx, sim_name in enumerate(joint_names):
-                sim_key = str(sim_name).strip()
-                if isinstance(raw_rad, dict) and sim_key in raw_rad:
-                    offsets[sim_idx] = float(raw_rad[sim_key])
-                    continue
-                if isinstance(raw_deg, dict) and sim_key in raw_deg:
-                    offsets[sim_idx] = float(np.deg2rad(float(raw_deg[sim_key])))
-                    continue
-                if isinstance(alias_cfg, dict):
-                    sim_key_norm = sim_key.lower()
-                    for logical_name, urdf_name in alias_cfg.items():
-                        urdf_key = str(urdf_name).strip().lower()
-                        logical_key = str(logical_name).strip()
-                        if sim_key_norm != urdf_key:
-                            continue
-                        if isinstance(raw_rad, dict) and logical_key in raw_rad:
-                            offsets[sim_idx] = float(raw_rad[logical_key])
-                        elif isinstance(raw_deg, dict) and logical_key in raw_deg:
-                            offsets[sim_idx] = float(np.deg2rad(float(raw_deg[logical_key])))
-                        break
-        except Exception:
-            pass
-        return offsets
+        # The corrected URDF is now the single source of truth for both sim and hardware.
+        # GUI-side simulation offsets only create hidden discrepancies, especially on wrist_flex.
+        return np.zeros(len(joint_names), dtype=float)
 
     def _sim_limits_from_model_limits(self, model_limits: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         out: List[Tuple[float, float]] = []

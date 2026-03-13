@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
 
+from ..config import load_calibration_json
 from .errors import (
     CapabilityError,
     ConnectionError,
@@ -102,6 +103,7 @@ class Robot:
         self._robot_cfg = robot_cfg if isinstance(robot_cfg, dict) else {}
         self._ik_cfg = self.config.get("ik", {}) if isinstance(self.config, dict) else {}
         self._control_cfg = self.config.get("control", {}) if isinstance(self.config, dict) else {}
+        self._calibration_payload = self._load_calibration_payload()
         self._twin_q: Optional[np.ndarray] = None
         self._twin_gripper_ratio: Optional[float] = None
         self._cartesian_locked_joints = [
@@ -509,9 +511,51 @@ class Robot:
         return [str(name) for name in raw if str(name) in self.robot_model.joint_name_to_index]
 
     def _resolve_home_q(self) -> np.ndarray:
+        meta = self._calibration_payload.get("_meta")
+        if isinstance(meta, dict):
+            home_joint_deg = meta.get("home_joint_deg")
+            if isinstance(home_joint_deg, dict):
+                resolved = np.array(
+                    [float(home_joint_deg.get(name, _DEFAULT_HOME_DEG.get(name, 0.0))) for name in self.robot_model.joint_names],
+                    dtype=float,
+                )
+                return np.deg2rad(resolved)
         return np.deg2rad(
             np.array([_DEFAULT_HOME_DEG.get(name, 0.0) for name in self.robot_model.joint_names], dtype=float)
         )
+
+    def _load_calibration_payload(self) -> Dict[str, Any]:
+        tcfg = self.config.get("transport", {}) if isinstance(self.config, dict) else {}
+        ccfg = self.config.get("calibration", {}) if isinstance(self.config, dict) else {}
+
+        candidates: list[Path] = []
+        explicit = str(ccfg.get("path", "") or tcfg.get("calibration_path", "") or "").strip()
+        if explicit:
+            candidates.append(Path(explicit).expanduser())
+
+        robot_id = str(tcfg.get("robot_id", "follower_moce") or "follower_moce").strip()
+        try:
+            from ..transport.serial import _candidate_calibration_paths
+
+            candidates.extend(_candidate_calibration_paths(robot_id))
+        except Exception:
+            pass
+
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not path.exists():
+                continue
+            try:
+                payload = load_calibration_json(str(path))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return {}
 
     def _check_limits(self, q: np.ndarray) -> None:
         lower = np.array([l for l, _ in self.robot_model.joint_limits], dtype=float)

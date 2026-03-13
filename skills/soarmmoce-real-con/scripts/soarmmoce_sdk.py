@@ -162,6 +162,33 @@ def _load_calibration(robot_name: str, calib_dir: Path) -> dict[str, MotorCalibr
         return draccus.load(dict[str, MotorCalibration], f)
 
 
+def _sync_single_turn_calibration_registers(
+    bus: FeetechMotorsBus,
+    calibration: Dict[str, MotorCalibration],
+) -> None:
+    current_hw = bus.read_calibration()
+    for joint_name in JOINTS:
+        if joint_name in MULTI_TURN_JOINTS:
+            continue
+        target = calibration.get(joint_name)
+        if target is None:
+            continue
+        current = current_hw.get(joint_name)
+        target_offset = int(target.homing_offset)
+        target_min = int(target.range_min)
+        target_max = int(target.range_max)
+        if (
+            current is not None
+            and int(current.homing_offset) == target_offset
+            and int(current.range_min) == target_min
+            and int(current.range_max) == target_max
+        ):
+            continue
+        bus.write("Homing_Offset", joint_name, target_offset, normalize=False)
+        bus.write("Min_Position_Limit", joint_name, target_min, normalize=False)
+        bus.write("Max_Position_Limit", joint_name, target_max, normalize=False)
+
+
 def _candidate_calibration_dirs() -> list[Path]:
     env = _env_value("SOARMMOCE_CALIB_DIR")
     candidates: list[Path] = []
@@ -848,6 +875,7 @@ class SoArmMoceController:
             bus.connect()
             with bus.torque_disabled():
                 bus.configure_motors()
+                _sync_single_turn_calibration_registers(bus, calib)
                 for name in JOINTS:
                     if name in MULTI_TURN_JOINTS:
                         bus.write("Lock", name, 0)

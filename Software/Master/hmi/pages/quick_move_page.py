@@ -91,6 +91,7 @@ class QuickMovePage(QWidget):
         step_row = QHBoxLayout()
         self.step_mode_combo = QComboBox()
         self.step_mode_combo.addItems(["Step", "Continuous"])
+        self.step_mode_combo.setCurrentIndex(0)
         self.step_dist_spin = QDoubleSpinBox()
         self.step_dist_spin.setRange(0.1, 200.0)
         self.step_dist_spin.setValue(5.0)

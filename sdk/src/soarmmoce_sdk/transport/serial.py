@@ -70,6 +70,30 @@ def _load_calibration(path: Path):
     return calib
 
 
+def _sync_single_turn_calibration_registers(bus, joint_names: Sequence[str], calibration: Dict[str, object]) -> None:
+    current_hw = bus.read_calibration()
+    for joint_name in joint_names:
+        if joint_name in DEFAULT_MULTI_TURN_JOINTS:
+            continue
+        target = calibration.get(joint_name)
+        if target is None:
+            continue
+        current = current_hw.get(joint_name)
+        target_offset = int(target.homing_offset)
+        target_min = int(target.range_min)
+        target_max = int(target.range_max)
+        if (
+            current is not None
+            and int(current.homing_offset) == target_offset
+            and int(current.range_min) == target_min
+            and int(current.range_max) == target_max
+        ):
+            continue
+        bus.write("Homing_Offset", joint_name, target_offset, normalize=False)
+        bus.write("Min_Position_Limit", joint_name, target_min, normalize=False)
+        bus.write("Max_Position_Limit", joint_name, target_max, normalize=False)
+
+
 def _candidate_calibration_paths(robot_id: str) -> list[Path]:
     robot_ids = []
     for candidate in ("soarmmoce", str(robot_id).strip(), "follower_moce"):
@@ -177,6 +201,7 @@ class SerialTransport(TransportBase):
             bus.connect()
             with bus.torque_disabled():
                 bus.configure_motors()
+                _sync_single_turn_calibration_registers(bus, self.joint_names, calibration)
                 for name in self.joint_names:
                     if name in self.multi_turn_joint_names:
                         bus.write("Lock", name, 0)
@@ -244,13 +269,12 @@ class SerialTransport(TransportBase):
             self._motion_cond.notify_all()
         if not self._connected or self._bus is None:
             return
-        state = self._read_joint_state_deg()
-        hold = {name: float(state[name]) for name in self.joint_names if name not in self.multi_turn_joint_names}
+        hold = self._build_single_turn_raw_hold_command()
         if hold:
             with self._io_lock:
                 self._bus.sync_write(
                     "Goal_Position",
-                    {name: self._joint_to_motor_deg(name, value) for name, value in hold.items()},
+                    hold,
                 )
 
     def wait_until_stopped(self, timeout: Optional[float] = None) -> bool:
@@ -449,6 +473,20 @@ class SerialTransport(TransportBase):
             else:
                 joints[name] = self._single_turn_present_raw_to_joint_deg(name, float(raw_motor.get(name, 0.0)))
         return joints
+
+    def _read_raw_present_position(self) -> Dict[str, int]:
+        bus = self._assert_bus()
+        with self._io_lock:
+            raw_motor = bus.sync_read("Present_Position", normalize=False)
+        return {name: int(raw_motor.get(name, 0)) for name in self.joint_names}
+
+    def _build_single_turn_raw_hold_command(self) -> Dict[str, float]:
+        raw_present = self._read_raw_present_position()
+        return {
+            name: float(int(raw_present[name]))
+            for name in self.joint_names
+            if name in raw_present and name not in self.multi_turn_joint_names
+        }
 
     def _build_bus_command(self, target_joint_deg: Dict[str, float], current_joint_deg: Dict[str, float]) -> Dict[str, float]:
         cmd: Dict[str, float] = {}
