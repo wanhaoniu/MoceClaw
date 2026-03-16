@@ -1,4 +1,4 @@
-"""Floating speech input window with local STT/TTS providers."""
+"""Floating speech input window with Groq STT/TTS providers."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ import json
 import os
 import re
 import subprocess
-import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -36,32 +34,13 @@ TTS_PROVIDER_DEFAULT = "groq"
 GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL_DEFAULT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL_DEFAULT = "whisper-large-v3"
+
 GROQ_TTS_URL_DEFAULT = "https://api.groq.com/openai/v1/audio/speech"
 GROQ_TTS_MODEL_DEFAULT = "canopylabs/orpheus-v1-english"
 GROQ_TTS_VOICE_DEFAULT = "troy"
 GROQ_TTS_RESPONSE_FORMAT_DEFAULT = "wav"
 GROQ_TTS_TIMEOUT_SEC_DEFAULT = 45.0
 GROQ_TTS_MAX_CHARS_DEFAULT = 180
-
-WHISPERLIVEKIT_STT_URL_DEFAULT = "http://127.0.0.1:8000/v1/audio/transcriptions"
-WHISPERLIVEKIT_STT_MODEL_DEFAULT = "whisper-1"
-WHISPERLIVEKIT_TIMEOUT_SEC_DEFAULT = 45.0
-
-KITTENTTS_MODEL_DEFAULT = "KittenML/kitten-tts-nano-0.8"
-KITTENTTS_VOICE_DEFAULT = "Jasper"
-KITTENTTS_TIMEOUT_SEC_DEFAULT = 60.0
-KITTENTTS_BRIDGE_SCRIPT_DEFAULT = str((Path(__file__).resolve().parent / "kitten_tts_bridge.py").resolve())
-KITTENTTS_CONDA_ENV_DEFAULT = "kittentts"
-QWEN3TTS_MODEL_DEFAULT = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-QWEN3TTS_VOICE_DEFAULT = "Vivian"
-QWEN3TTS_LANGUAGE_DEFAULT = "Auto"
-QWEN3TTS_INSTRUCT_DEFAULT = ""
-QWEN3TTS_DEVICE_DEFAULT = "auto"
-QWEN3TTS_DTYPE_DEFAULT = "auto"
-QWEN3TTS_TIMEOUT_SEC_DEFAULT = 120.0
-QWEN3TTS_MAX_CHARS_DEFAULT = 140
-QWEN3TTS_BRIDGE_SCRIPT_DEFAULT = str((Path(__file__).resolve().parent / "qwen3_tts_bridge.py").resolve())
-QWEN3TTS_CONDA_ENV_DEFAULT = "qwen3tts"
 
 OPENCLAW_BIN_DEFAULT = "openclaw"
 OPENCLAW_AGENT_ID_DEFAULT = "main"
@@ -82,35 +61,6 @@ def _env_bool(name: str, default: bool) -> bool:
     if val in ("0", "false", "no", "off", "n"):
         return False
     return bool(default)
-
-
-def _resolve_python_command(*, python_bin: str, conda_env: str) -> List[str]:
-    explicit_python = str(python_bin or "").strip()
-    if explicit_python:
-        return [explicit_python]
-
-    target_env = str(conda_env or "").strip()
-    if target_env:
-        conda_exe = str(os.environ.get("CONDA_EXE", "")).strip()
-        candidate_bases: List[Path] = []
-        if conda_exe:
-            try:
-                candidate_bases.append(Path(conda_exe).expanduser().resolve().parent.parent)
-            except Exception:
-                pass
-        candidate_bases.extend(
-            [
-                Path.home() / "miniconda3",
-                Path.home() / "anaconda3",
-            ]
-        )
-        for base in candidate_bases:
-            python_path = (base / "envs" / target_env / "bin" / "python").resolve()
-            if python_path.exists():
-                return [str(python_path)]
-        return ["conda", "run", "-n", target_env, "python"]
-
-    return [sys.executable]
 
 
 def _extract_text_from_stt_payload(payload: Any) -> str:
@@ -418,19 +368,24 @@ def _extract_http_error_message(response: requests.Response, fallback: str) -> s
 
 
 def _format_stt_exception(provider: str, url: str, exc: Exception) -> str:
-    provider_norm = str(provider or "").strip().lower()
     if isinstance(exc, requests.exceptions.ConnectionError):
-        if provider_norm == "whisperlivekit":
-            return (
-                "WhisperLiveKit 本地服务未启动。\n"
-                f"当前地址: {url}\n"
-                "先启动本地 STT 服务，再打开语音窗。\n"
-                "参考命令:\n"
-                "  pip install whisperlivekit\n"
-                "  wlk --model large-v3 --language zh"
-            )
-        return f"STT 服务连接失败: {url}"
-    return str(exc).strip() or f"{provider_norm or 'stt'} failed"
+        detail = str(exc).strip()
+        message = f"STT 服务连接失败: {url}"
+        if detail:
+            message += f"\n详细错误: {detail}"
+        return message
+    return str(exc).strip() or f"{str(provider or '').strip().lower() or 'stt'} failed"
+
+
+def _is_retryable_stt_request_error(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.SSLError,
+        ),
+    )
 
 
 def _split_text_for_tts(text: str, max_chars: int) -> List[str]:
@@ -499,6 +454,26 @@ def _decode_wav_bytes(wav_bytes: bytes) -> Tuple[np.ndarray, int]:
     return audio, sample_rate
 
 
+_AUDIO_IO_LOCK = threading.RLock()
+_AUDIO_PLAYBACK_POLL_MS = 20
+
+
+def _to_float32_audio_frames(audio: np.ndarray) -> np.ndarray:
+    arr = np.asarray(audio)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+
+    if arr.dtype == np.uint8:
+        frames = (arr.astype(np.float32) - 128.0) / 128.0
+    elif arr.dtype == np.int16:
+        frames = arr.astype(np.float32) / 32768.0
+    elif arr.dtype == np.int32:
+        frames = arr.astype(np.float32) / 2147483648.0
+    else:
+        frames = arr.astype(np.float32, copy=False)
+    return np.ascontiguousarray(frames, dtype=np.float32)
+
+
 def groq_text_to_speech(
     text: str,
     api_key: str,
@@ -536,10 +511,48 @@ def groq_text_to_speech(
     return response.content
 
 
-def play_wav_bytes(wav_bytes: bytes):
+def play_wav_bytes(wav_bytes: bytes, stop_event: Optional[threading.Event] = None):
     audio, sample_rate = _decode_wav_bytes(wav_bytes)
-    sd.play(audio, sample_rate)
-    sd.wait()
+    frames = _to_float32_audio_frames(audio)
+    if frames.size == 0:
+        return
+
+    stopper = stop_event or threading.Event()
+    total_frames = int(frames.shape[0])
+    channels = int(frames.shape[1])
+    frame_cursor = 0
+
+    def _callback(outdata, frame_count, _time_info, _status):
+        nonlocal frame_cursor
+        outdata.fill(0)
+        if stopper.is_set():
+            raise sd.CallbackStop
+
+        next_cursor = min(frame_cursor + int(frame_count), total_frames)
+        chunk = frames[frame_cursor:next_cursor]
+        if chunk.size:
+            outdata[: next_cursor - frame_cursor, :channels] = chunk
+        frame_cursor = next_cursor
+        if frame_cursor >= total_frames:
+            raise sd.CallbackStop
+
+    with _AUDIO_IO_LOCK:
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=channels,
+            dtype="float32",
+            callback=_callback,
+            blocksize=0,
+        )
+        with stream:
+            while stream.active:
+                if stopper.is_set():
+                    try:
+                        stream.abort()
+                    except Exception:
+                        pass
+                    break
+                sd.sleep(_AUDIO_PLAYBACK_POLL_MS)
 
 
 def openai_compatible_audio_to_text(
@@ -562,34 +575,47 @@ def openai_compatible_audio_to_text(
         data["language"] = language
 
     data["response_format"] = "json"
+    timeout = float(timeout_sec)
+    last_exc: Optional[Exception] = None
 
-    response = requests.post(
-        url,
-        headers=headers,
-        data=data,
-        files={"file": ("speech.wav", wav_bytes, "audio/wav")},
-        timeout=float(timeout_sec),
-    )
-    response.raise_for_status()
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                data=data,
+                files={"file": ("speech.wav", wav_bytes, "audio/wav")},
+                timeout=timeout,
+            )
+            response.raise_for_status()
 
-    try:
-        payload: Any = response.json()
-    except Exception:
-        text_raw = response.text.strip()
-        if text_raw:
-            return text_raw
-        raise RuntimeError("STT response is empty")
+            try:
+                payload: Any = response.json()
+            except Exception:
+                text_raw = response.text.strip()
+                if text_raw:
+                    return text_raw
+                raise RuntimeError("STT response is empty")
 
-    if isinstance(payload, dict):
-        err = payload.get("error")
-        if isinstance(err, dict):
-            err_msg = str(err.get("message", "STT failed"))
-            raise RuntimeError(err_msg)
+            if isinstance(payload, dict):
+                err = payload.get("error")
+                if isinstance(err, dict):
+                    err_msg = str(err.get("message", "STT failed"))
+                    raise RuntimeError(err_msg)
 
-    text = _extract_text_from_stt_payload(payload)
-    if not text:
-        raise RuntimeError(f"STT response has no text: {payload}")
-    return text
+            text = _extract_text_from_stt_payload(payload)
+            if not text:
+                raise RuntimeError(f"STT response has no text: {payload}")
+            return text
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 2 or not _is_retryable_stt_request_error(exc):
+                raise
+            time.sleep(0.4 * (attempt + 1))
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("STT request failed unexpectedly")
 
 
 class _SttWorker(QThread):
@@ -600,7 +626,6 @@ class _SttWorker(QThread):
         self,
         *,
         wav_bytes: bytes,
-        provider: str,
         api_key: str,
         url: str,
         model: str,
@@ -609,7 +634,6 @@ class _SttWorker(QThread):
     ):
         super().__init__()
         self._wav_bytes = wav_bytes
-        self._provider = str(provider or "").strip().lower()
         self._api_key = api_key
         self._url = url
         self._model = model
@@ -618,8 +642,6 @@ class _SttWorker(QThread):
 
     def run(self):
         try:
-            if self._provider not in {"whisperlivekit", "groq", "openai"}:
-                raise ValueError(f"Unsupported STT provider: {self._provider}")
             text = openai_compatible_audio_to_text(
                 wav_bytes=self._wav_bytes,
                 api_key=self._api_key,
@@ -629,389 +651,9 @@ class _SttWorker(QThread):
                 timeout_sec=self._timeout_sec,
             )
         except Exception as exc:
-            self.failed.emit(_format_stt_exception(self._provider, self._url, exc))
+            self.failed.emit(_format_stt_exception("groq", self._url, exc))
             return
         self.done.emit(text)
-
-
-class _KittenTtsBridgeClient:
-    def __init__(
-        self,
-        *,
-        model: str,
-        voice: str,
-        timeout_sec: float,
-        python_bin: str,
-        conda_env: str,
-        bridge_script: str,
-    ):
-        self._model = str(model or "").strip() or KITTENTTS_MODEL_DEFAULT
-        self._voice = str(voice or "").strip() or KITTENTTS_VOICE_DEFAULT
-        self._timeout_sec = max(5.0, float(timeout_sec))
-        self._python_bin = str(python_bin or "").strip()
-        self._conda_env = str(conda_env or "").strip()
-        self._bridge_script = str(bridge_script or "").strip() or KITTENTTS_BRIDGE_SCRIPT_DEFAULT
-        self._proc: Optional[subprocess.Popen[str]] = None
-        self._lock = threading.RLock()
-
-    def _build_command(self) -> List[str]:
-        script = str(Path(self._bridge_script).expanduser().resolve())
-        cmd = _resolve_python_command(python_bin=self._python_bin, conda_env=self._conda_env)
-        cmd.extend([script, "--model", self._model])
-        return cmd
-
-    def _ensure_proc(self) -> subprocess.Popen[str]:
-        if self._proc is not None and self._proc.poll() is None:
-            return self._proc
-
-        env = os.environ.copy()
-        env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        self._proc = subprocess.Popen(
-            self._build_command(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
-        return self._proc
-
-    def close(self):
-        with self._lock:
-            proc = self._proc
-            self._proc = None
-            if proc is None:
-                return
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-    def update_config(
-        self,
-        *,
-        model: Optional[str] = None,
-        voice: Optional[str] = None,
-        timeout_sec: Optional[float] = None,
-        python_bin: Optional[str] = None,
-        conda_env: Optional[str] = None,
-        bridge_script: Optional[str] = None,
-    ):
-        restart = False
-        if model is not None:
-            new_model = str(model or "").strip() or KITTENTTS_MODEL_DEFAULT
-            restart = restart or (new_model != self._model)
-            self._model = new_model
-        if voice is not None:
-            self._voice = str(voice or "").strip() or KITTENTTS_VOICE_DEFAULT
-        if timeout_sec is not None:
-            self._timeout_sec = max(5.0, float(timeout_sec))
-        if python_bin is not None:
-            new_python = str(python_bin or "").strip()
-            restart = restart or (new_python != self._python_bin)
-            self._python_bin = new_python
-        if conda_env is not None:
-            new_env = str(conda_env or "").strip()
-            restart = restart or (new_env != self._conda_env)
-            self._conda_env = new_env
-        if bridge_script is not None:
-            new_script = str(bridge_script or "").strip() or KITTENTTS_BRIDGE_SCRIPT_DEFAULT
-            restart = restart or (new_script != self._bridge_script)
-            self._bridge_script = new_script
-        if restart:
-            self.close()
-
-    def synthesize(self, text: str, voice: str = "") -> bytes:
-        content = str(text or "").strip()
-        if not content:
-            raise ValueError("Empty TTS text")
-        request_voice = str(voice or "").strip() or self._voice
-        with self._lock:
-            proc = self._ensure_proc()
-            if proc.stdin is None or proc.stdout is None:
-                raise RuntimeError("KittenTTS bridge stdio is unavailable")
-            request_id = uuid.uuid4().hex
-            temp_dir = Path(tempfile.mkdtemp(prefix="soarmmoce-kitten-tts-"))
-            out_path = temp_dir / "reply.wav"
-            payload = {
-                "id": request_id,
-                "text": content,
-                "voice": request_voice,
-                "output_path": str(out_path),
-            }
-            try:
-                proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                proc.stdin.flush()
-            except Exception as exc:
-                self.close()
-                raise RuntimeError(f"Failed to send request to KittenTTS bridge: {exc}") from exc
-
-            deadline = time.time() + self._timeout_sec
-            try:
-                while True:
-                    if proc.poll() is not None:
-                        stderr_text = ""
-                        if proc.stderr is not None:
-                            try:
-                                stderr_text = proc.stderr.read().strip()
-                            except Exception:
-                                stderr_text = ""
-                        raise RuntimeError(stderr_text or "KittenTTS bridge exited unexpectedly")
-                    if time.time() > deadline:
-                        self.close()
-                        raise TimeoutError("Timed out waiting for KittenTTS bridge")
-                    line = proc.stdout.readline()
-                    if not line:
-                        time.sleep(0.02)
-                        continue
-                    payload = _parse_json_with_noise(line)
-                    if not isinstance(payload, dict):
-                        continue
-                    if str(payload.get("id", "")).strip() != request_id:
-                        continue
-                    if not bool(payload.get("ok", False)):
-                        raise RuntimeError(str(payload.get("error", "KittenTTS bridge failed")).strip())
-                    if not out_path.exists():
-                        raise RuntimeError("KittenTTS bridge did not produce output audio")
-                    return out_path.read_bytes()
-            finally:
-                try:
-                    if out_path.exists():
-                        out_path.unlink()
-                except Exception:
-                    pass
-                try:
-                    temp_dir.rmdir()
-                except Exception:
-                    pass
-
-
-class _Qwen3TtsBridgeClient:
-    def __init__(
-        self,
-        *,
-        model: str,
-        voice: str,
-        language: str,
-        instruct: str,
-        device: str,
-        dtype: str,
-        timeout_sec: float,
-        max_chars: int,
-        python_bin: str,
-        conda_env: str,
-        bridge_script: str,
-    ):
-        self._model = str(model or "").strip() or QWEN3TTS_MODEL_DEFAULT
-        self._voice = str(voice or "").strip() or QWEN3TTS_VOICE_DEFAULT
-        self._language = str(language or "").strip() or QWEN3TTS_LANGUAGE_DEFAULT
-        self._instruct = str(instruct or "").strip()
-        self._device = str(device or "").strip() or QWEN3TTS_DEVICE_DEFAULT
-        self._dtype = str(dtype or "").strip() or QWEN3TTS_DTYPE_DEFAULT
-        self._timeout_sec = max(5.0, float(timeout_sec))
-        self._max_chars = max(32, int(max_chars))
-        self._python_bin = str(python_bin or "").strip()
-        self._conda_env = str(conda_env or "").strip()
-        self._bridge_script = str(bridge_script or "").strip() or QWEN3TTS_BRIDGE_SCRIPT_DEFAULT
-        self._proc: Optional[subprocess.Popen[str]] = None
-        self._lock = threading.RLock()
-
-    def _build_command(self) -> List[str]:
-        script = str(Path(self._bridge_script).expanduser().resolve())
-        cmd = _resolve_python_command(python_bin=self._python_bin, conda_env=self._conda_env)
-        cmd.extend(
-            [
-                script,
-                "--model",
-                self._model,
-                "--language",
-                self._language,
-                "--device",
-                self._device,
-                "--dtype",
-                self._dtype,
-            ]
-        )
-        if self._instruct:
-            cmd.extend(["--instruct", self._instruct])
-        return cmd
-
-    def _ensure_proc(self) -> subprocess.Popen[str]:
-        if self._proc is not None and self._proc.poll() is None:
-            return self._proc
-
-        env = os.environ.copy()
-        env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        self._proc = subprocess.Popen(
-            self._build_command(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
-        return self._proc
-
-    def close(self):
-        with self._lock:
-            proc = self._proc
-            self._proc = None
-            if proc is None:
-                return
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-    def update_config(
-        self,
-        *,
-        model: Optional[str] = None,
-        voice: Optional[str] = None,
-        language: Optional[str] = None,
-        instruct: Optional[str] = None,
-        device: Optional[str] = None,
-        dtype: Optional[str] = None,
-        timeout_sec: Optional[float] = None,
-        max_chars: Optional[int] = None,
-        python_bin: Optional[str] = None,
-        conda_env: Optional[str] = None,
-        bridge_script: Optional[str] = None,
-    ):
-        restart = False
-        if model is not None:
-            new_model = str(model or "").strip() or QWEN3TTS_MODEL_DEFAULT
-            restart = restart or (new_model != self._model)
-            self._model = new_model
-        if voice is not None:
-            self._voice = str(voice or "").strip() or QWEN3TTS_VOICE_DEFAULT
-        if language is not None:
-            self._language = str(language or "").strip() or QWEN3TTS_LANGUAGE_DEFAULT
-        if instruct is not None:
-            new_instruct = str(instruct or "").strip()
-            restart = restart or (new_instruct != self._instruct)
-            self._instruct = new_instruct
-        if device is not None:
-            new_device = str(device or "").strip() or QWEN3TTS_DEVICE_DEFAULT
-            restart = restart or (new_device != self._device)
-            self._device = new_device
-        if dtype is not None:
-            new_dtype = str(dtype or "").strip() or QWEN3TTS_DTYPE_DEFAULT
-            restart = restart or (new_dtype != self._dtype)
-            self._dtype = new_dtype
-        if timeout_sec is not None:
-            self._timeout_sec = max(5.0, float(timeout_sec))
-        if max_chars is not None:
-            self._max_chars = max(32, int(max_chars))
-        if python_bin is not None:
-            new_python = str(python_bin or "").strip()
-            restart = restart or (new_python != self._python_bin)
-            self._python_bin = new_python
-        if conda_env is not None:
-            new_env = str(conda_env or "").strip()
-            restart = restart or (new_env != self._conda_env)
-            self._conda_env = new_env
-        if bridge_script is not None:
-            new_script = str(bridge_script or "").strip() or QWEN3TTS_BRIDGE_SCRIPT_DEFAULT
-            restart = restart or (new_script != self._bridge_script)
-            self._bridge_script = new_script
-        if restart:
-            self.close()
-
-    def synthesize(
-        self,
-        text: str,
-        *,
-        voice: str = "",
-        language: str = "",
-        instruct: str = "",
-    ) -> bytes:
-        content = str(text or "").strip()
-        if not content:
-            raise ValueError("Empty TTS text")
-        request_voice = str(voice or "").strip() or self._voice
-        request_language = str(language or "").strip() or self._language
-        request_instruct = str(instruct or "").strip() or self._instruct
-        with self._lock:
-            proc = self._ensure_proc()
-            if proc.stdin is None or proc.stdout is None:
-                raise RuntimeError("Qwen3-TTS bridge stdio is unavailable")
-            request_id = uuid.uuid4().hex
-            temp_dir = Path(tempfile.mkdtemp(prefix="soarmmoce-qwen3-tts-"))
-            out_path = temp_dir / "reply.wav"
-            payload = {
-                "id": request_id,
-                "text": content,
-                "voice": request_voice,
-                "language": request_language,
-                "instruct": request_instruct,
-                "output_path": str(out_path),
-            }
-            try:
-                proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                proc.stdin.flush()
-            except Exception as exc:
-                self.close()
-                raise RuntimeError(f"Failed to send request to Qwen3-TTS bridge: {exc}") from exc
-
-            deadline = time.time() + self._timeout_sec
-            try:
-                while True:
-                    if proc.poll() is not None:
-                        stderr_text = ""
-                        if proc.stderr is not None:
-                            try:
-                                stderr_text = proc.stderr.read().strip()
-                            except Exception:
-                                stderr_text = ""
-                        raise RuntimeError(stderr_text or "Qwen3-TTS bridge exited unexpectedly")
-                    if time.time() > deadline:
-                        self.close()
-                        raise TimeoutError("Timed out waiting for Qwen3-TTS bridge")
-                    line = proc.stdout.readline()
-                    if not line:
-                        time.sleep(0.02)
-                        continue
-                    payload = _parse_json_with_noise(line)
-                    if not isinstance(payload, dict):
-                        continue
-                    if str(payload.get("id", "")).strip() != request_id:
-                        continue
-                    if not bool(payload.get("ok", False)):
-                        raise RuntimeError(str(payload.get("error", "Qwen3-TTS bridge failed")).strip())
-                    if not out_path.exists():
-                        raise RuntimeError("Qwen3-TTS bridge did not produce output audio")
-                    return out_path.read_bytes()
-            finally:
-                try:
-                    if out_path.exists():
-                        out_path.unlink()
-                except Exception:
-                    pass
-                try:
-                    temp_dir.rmdir()
-                except Exception:
-                    pass
 
 
 class _GroqTtsWorker(QThread):
@@ -1037,13 +679,11 @@ class _GroqTtsWorker(QThread):
         self._response_format = str(response_format or "").strip() or GROQ_TTS_RESPONSE_FORMAT_DEFAULT
         self._timeout_sec = max(5.0, float(timeout_sec))
         self._max_chars = max(32, int(max_chars))
+        self._stop_event = threading.Event()
 
     def stop(self):
         self.requestInterruption()
-        try:
-            sd.stop()
-        except Exception:
-            pass
+        self._stop_event.set()
 
     def run(self):
         try:
@@ -1064,102 +704,7 @@ class _GroqTtsWorker(QThread):
                 )
                 if self.isInterruptionRequested():
                     return
-                play_wav_bytes(wav_bytes)
-                if self.isInterruptionRequested():
-                    return
-        except Exception as exc:
-            if not self.isInterruptionRequested():
-                self.failed.emit(str(exc))
-
-
-class _KittenTtsWorker(QThread):
-    failed = pyqtSignal(str)
-
-    def __init__(
-        self,
-        *,
-        text: str,
-        bridge: _KittenTtsBridgeClient,
-        voice: str,
-        max_chars: int,
-    ):
-        super().__init__()
-        self._text = str(text or "").strip()
-        self._bridge = bridge
-        self._voice = str(voice or "").strip()
-        self._max_chars = max(32, int(max_chars))
-
-    def stop(self):
-        self.requestInterruption()
-        try:
-            sd.stop()
-        except Exception:
-            pass
-
-    def run(self):
-        try:
-            chunks = _split_text_for_tts(self._text, self._max_chars)
-            if not chunks:
-                raise ValueError("Empty TTS text")
-            for chunk in chunks:
-                if self.isInterruptionRequested():
-                    return
-                wav_bytes = self._bridge.synthesize(chunk, voice=self._voice)
-                if self.isInterruptionRequested():
-                    return
-                play_wav_bytes(wav_bytes)
-                if self.isInterruptionRequested():
-                    return
-        except Exception as exc:
-            if not self.isInterruptionRequested():
-                self.failed.emit(str(exc))
-
-
-class _Qwen3TtsWorker(QThread):
-    failed = pyqtSignal(str)
-
-    def __init__(
-        self,
-        *,
-        text: str,
-        bridge: _Qwen3TtsBridgeClient,
-        voice: str,
-        language: str,
-        instruct: str,
-        max_chars: int,
-    ):
-        super().__init__()
-        self._text = str(text or "").strip()
-        self._bridge = bridge
-        self._voice = str(voice or "").strip()
-        self._language = str(language or "").strip()
-        self._instruct = str(instruct or "").strip()
-        self._max_chars = max(32, int(max_chars))
-
-    def stop(self):
-        self.requestInterruption()
-        try:
-            sd.stop()
-        except Exception:
-            pass
-
-    def run(self):
-        try:
-            chunks = _split_text_for_tts(self._text, self._max_chars)
-            if not chunks:
-                raise ValueError("Empty TTS text")
-            for chunk in chunks:
-                if self.isInterruptionRequested():
-                    return
-                wav_bytes = self._bridge.synthesize(
-                    chunk,
-                    voice=self._voice,
-                    language=self._language,
-                    instruct=self._instruct,
-                )
-                if self.isInterruptionRequested():
-                    return
-                play_wav_bytes(wav_bytes)
+                play_wav_bytes(wav_bytes, self._stop_event)
                 if self.isInterruptionRequested():
                     return
         except Exception as exc:
@@ -1231,6 +776,9 @@ class _OpenClawAgentWorker(QThread):
         cmd = self._build_agent_cmd(message=message, session_id=session_id)
         cwd = None
         env = self._build_subprocess_env()
+        start_time = time.time()
+        start_perf = time.perf_counter()
+        proc: Optional[subprocess.CompletedProcess[str]] = None
         if self._robot_mode:
             skill_dir = Path.home() / ".openclaw" / "skills" / self._skill_name
             if skill_dir.exists() and skill_dir.is_dir():
@@ -1245,29 +793,60 @@ class _OpenClawAgentWorker(QThread):
                 cwd=cwd,
                 env=env,
             )
+            stdout_text = str(proc.stdout or "").strip()
+            stderr_text = str(proc.stderr or "").strip()
+            if proc.returncode != 0:
+                err = stderr_text or stdout_text or f"OpenClaw 返回错误码 {proc.returncode}"
+                raise RuntimeError(err)
+
+            payload = _parse_json_with_noise(stdout_text)
+            if payload is None and stderr_text:
+                payload = _parse_json_with_noise(stderr_text)
+            if payload is None:
+                payload = {"text": stdout_text}
+            return {
+                "payload": payload,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+            }
         except FileNotFoundError:
             raise RuntimeError(f"找不到 OpenClaw 可执行文件: {self._openclaw_bin}")
         except subprocess.TimeoutExpired:
             raise RuntimeError("OpenClaw 调用超时")
         except Exception as exc:
             raise RuntimeError(f"OpenClaw 调用失败: {exc}") from exc
+        finally:
+            end_time = time.time()
+            elapsed_sec = time.perf_counter() - start_perf
+            self._log_openclaw_invoke_timing(
+                start_time=start_time,
+                end_time=end_time,
+                elapsed_sec=elapsed_sec,
+                returncode=proc.returncode if proc is not None else None,
+                session_id=session_id,
+                message=message,
+            )
 
-        stdout_text = str(proc.stdout or "").strip()
-        stderr_text = str(proc.stderr or "").strip()
-        if proc.returncode != 0:
-            err = stderr_text or stdout_text or f"OpenClaw 返回错误码 {proc.returncode}"
-            raise RuntimeError(err)
-
-        payload = _parse_json_with_noise(stdout_text)
-        if payload is None and stderr_text:
-            payload = _parse_json_with_noise(stderr_text)
-        if payload is None:
-            payload = {"text": stdout_text}
-        return {
-            "payload": payload,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-        }
+    def _log_openclaw_invoke_timing(
+        self,
+        *,
+        start_time: float,
+        end_time: float,
+        elapsed_sec: float,
+        returncode: Optional[int],
+        session_id: str,
+        message: str,
+    ) -> None:
+        print(
+            "[Speech][OpenClawTiming] "
+            f"start_time={start_time:.3f} "
+            f"end_time={end_time:.3f} "
+            f"elapsed_sec={elapsed_sec:.3f} "
+            f"returncode={returncode if returncode is not None else 'n/a'} "
+            f"session_id={'set' if session_id else 'new'} "
+            f"message_len={len(str(message or ''))}",
+            flush=True,
+        )
 
     def _prepare_message(self, message: str, retry: bool = False) -> str:
         base = str(message or "").strip()
@@ -1383,44 +962,33 @@ class SpeechInputWindow(QWidget):
         self._openclaw_worker: Optional[_OpenClawAgentWorker] = None
         self._tts_worker: Optional[QThread] = None
 
-        self._stt_provider = str(
-            os.getenv("SOARMMOCE_STT_PROVIDER", STT_PROVIDER_DEFAULT)
-        ).strip().lower() or STT_PROVIDER_DEFAULT
+        self._stt_provider = STT_PROVIDER_DEFAULT
         self._stt_api_key = str(
-            os.getenv("WHISPERLIVEKIT_API_KEY")
-            or os.getenv("SOARMMOCE_STT_API_KEY")
+            os.getenv("SOARMMOCE_STT_API_KEY")
             or os.getenv("GROQ_API_KEY")
             or GROQ_API_KEY_FALLBACK
             or ""
         ).strip()
-        if self._stt_provider == "groq":
-            self._stt_url = os.getenv("GROQ_STT_URL", GROQ_STT_URL_DEFAULT).strip()
-            self._stt_model = os.getenv("GROQ_STT_MODEL", GROQ_STT_MODEL_DEFAULT).strip()
-        else:
-            self._stt_url = os.getenv("WHISPERLIVEKIT_STT_URL", WHISPERLIVEKIT_STT_URL_DEFAULT).strip()
-            self._stt_model = os.getenv("WHISPERLIVEKIT_STT_MODEL", WHISPERLIVEKIT_STT_MODEL_DEFAULT).strip()
+        self._stt_url = os.getenv("GROQ_STT_URL", GROQ_STT_URL_DEFAULT).strip() or GROQ_STT_URL_DEFAULT
+        self._stt_model = os.getenv("GROQ_STT_MODEL", GROQ_STT_MODEL_DEFAULT).strip() or GROQ_STT_MODEL_DEFAULT
         try:
             self._stt_timeout_sec = float(
-                str(
-                    os.getenv(
-                        "SOARMMOCE_STT_TIMEOUT_SEC",
-                        str(WHISPERLIVEKIT_TIMEOUT_SEC_DEFAULT if self._stt_provider != "groq" else 45.0),
-                    )
-                ).strip()
+                str(os.getenv("SOARMMOCE_STT_TIMEOUT_SEC", "45.0")).strip()
             )
         except Exception:
-            self._stt_timeout_sec = WHISPERLIVEKIT_TIMEOUT_SEC_DEFAULT
+            self._stt_timeout_sec = 45.0
         self._stt_timeout_sec = max(5.0, self._stt_timeout_sec)
 
-        self._tts_provider = str(
-            os.getenv("SOARMMOCE_TTS_PROVIDER", TTS_PROVIDER_DEFAULT)
-        ).strip().lower() or TTS_PROVIDER_DEFAULT
+        self._tts_provider = TTS_PROVIDER_DEFAULT
         self._tts_enabled = _env_bool("SOARMMOCE_TTS_ENABLED", True)
         self._groq_api_key = str(os.getenv("GROQ_API_KEY") or GROQ_API_KEY_FALLBACK or "").strip()
-        self._groq_tts_url = os.getenv("GROQ_TTS_URL", GROQ_TTS_URL_DEFAULT).strip()
-        self._groq_tts_model = os.getenv("GROQ_TTS_MODEL", GROQ_TTS_MODEL_DEFAULT).strip()
-        self._groq_tts_voice = os.getenv("GROQ_TTS_VOICE", GROQ_TTS_VOICE_DEFAULT).strip()
-        self._groq_tts_response_format = os.getenv("GROQ_TTS_RESPONSE_FORMAT", GROQ_TTS_RESPONSE_FORMAT_DEFAULT).strip()
+        self._groq_tts_url = os.getenv("GROQ_TTS_URL", GROQ_TTS_URL_DEFAULT).strip() or GROQ_TTS_URL_DEFAULT
+        self._groq_tts_model = os.getenv("GROQ_TTS_MODEL", GROQ_TTS_MODEL_DEFAULT).strip() or GROQ_TTS_MODEL_DEFAULT
+        self._groq_tts_voice = os.getenv("GROQ_TTS_VOICE", GROQ_TTS_VOICE_DEFAULT).strip() or GROQ_TTS_VOICE_DEFAULT
+        self._groq_tts_response_format = (
+            os.getenv("GROQ_TTS_RESPONSE_FORMAT", GROQ_TTS_RESPONSE_FORMAT_DEFAULT).strip()
+            or GROQ_TTS_RESPONSE_FORMAT_DEFAULT
+        )
         try:
             self._groq_tts_timeout_sec = float(
                 str(os.getenv("GROQ_TTS_TIMEOUT_SEC", str(GROQ_TTS_TIMEOUT_SEC_DEFAULT))).strip()
@@ -1435,69 +1003,6 @@ class SpeechInputWindow(QWidget):
             )
         except Exception:
             self._groq_tts_max_chars = GROQ_TTS_MAX_CHARS_DEFAULT
-        self._kitten_tts_model = str(os.getenv("KITTENTTS_MODEL", KITTENTTS_MODEL_DEFAULT)).strip() or KITTENTTS_MODEL_DEFAULT
-        self._kitten_tts_voice = str(os.getenv("KITTENTTS_VOICE", KITTENTTS_VOICE_DEFAULT)).strip() or KITTENTTS_VOICE_DEFAULT
-        self._kitten_tts_python = str(
-            os.getenv("SOARMMOCE_KITTEN_PYTHON", os.getenv("KITTENTTS_PYTHON", ""))
-        ).strip()
-        self._kitten_tts_conda_env = str(
-            os.getenv(
-                "SOARMMOCE_KITTEN_CONDA_ENV",
-                os.getenv("KITTENTTS_CONDA_ENV", KITTENTTS_CONDA_ENV_DEFAULT),
-            )
-        ).strip() or KITTENTTS_CONDA_ENV_DEFAULT
-        self._kitten_tts_bridge_script = str(
-            os.getenv("SOARMMOCE_KITTEN_BRIDGE_SCRIPT", KITTENTTS_BRIDGE_SCRIPT_DEFAULT)
-        ).strip() or KITTENTTS_BRIDGE_SCRIPT_DEFAULT
-        try:
-            self._kitten_tts_timeout_sec = float(
-                str(os.getenv("KITTENTTS_TIMEOUT_SEC", str(KITTENTTS_TIMEOUT_SEC_DEFAULT))).strip()
-            )
-        except Exception:
-            self._kitten_tts_timeout_sec = KITTENTTS_TIMEOUT_SEC_DEFAULT
-        self._kitten_tts_timeout_sec = max(5.0, self._kitten_tts_timeout_sec)
-        self._kitten_bridge: Optional[_KittenTtsBridgeClient] = None
-        self._qwen3_tts_model = str(os.getenv("QWEN3TTS_MODEL", QWEN3TTS_MODEL_DEFAULT)).strip() or QWEN3TTS_MODEL_DEFAULT
-        self._qwen3_tts_voice = str(os.getenv("QWEN3TTS_VOICE", QWEN3TTS_VOICE_DEFAULT)).strip() or QWEN3TTS_VOICE_DEFAULT
-        self._qwen3_tts_language = str(
-            os.getenv("QWEN3TTS_LANGUAGE", QWEN3TTS_LANGUAGE_DEFAULT)
-        ).strip() or QWEN3TTS_LANGUAGE_DEFAULT
-        self._qwen3_tts_instruct = str(
-            os.getenv("QWEN3TTS_INSTRUCT", QWEN3TTS_INSTRUCT_DEFAULT)
-        ).strip()
-        self._qwen3_tts_device = str(
-            os.getenv("QWEN3TTS_DEVICE", QWEN3TTS_DEVICE_DEFAULT)
-        ).strip() or QWEN3TTS_DEVICE_DEFAULT
-        self._qwen3_tts_dtype = str(
-            os.getenv("QWEN3TTS_DTYPE", QWEN3TTS_DTYPE_DEFAULT)
-        ).strip() or QWEN3TTS_DTYPE_DEFAULT
-        self._qwen3_tts_python = str(
-            os.getenv("SOARMMOCE_QWEN3TTS_PYTHON", os.getenv("QWEN3TTS_PYTHON", ""))
-        ).strip()
-        self._qwen3_tts_conda_env = str(
-            os.getenv(
-                "SOARMMOCE_QWEN3TTS_CONDA_ENV",
-                os.getenv("QWEN3TTS_CONDA_ENV", QWEN3TTS_CONDA_ENV_DEFAULT),
-            )
-        ).strip() or QWEN3TTS_CONDA_ENV_DEFAULT
-        self._qwen3_tts_bridge_script = str(
-            os.getenv("SOARMMOCE_QWEN3TTS_BRIDGE_SCRIPT", QWEN3TTS_BRIDGE_SCRIPT_DEFAULT)
-        ).strip() or QWEN3TTS_BRIDGE_SCRIPT_DEFAULT
-        try:
-            self._qwen3_tts_timeout_sec = float(
-                str(os.getenv("QWEN3TTS_TIMEOUT_SEC", str(QWEN3TTS_TIMEOUT_SEC_DEFAULT))).strip()
-            )
-        except Exception:
-            self._qwen3_tts_timeout_sec = QWEN3TTS_TIMEOUT_SEC_DEFAULT
-        self._qwen3_tts_timeout_sec = max(5.0, self._qwen3_tts_timeout_sec)
-        try:
-            self._qwen3_tts_max_chars = max(
-                32,
-                int(str(os.getenv("QWEN3TTS_MAX_CHARS", str(QWEN3TTS_MAX_CHARS_DEFAULT))).strip()),
-            )
-        except Exception:
-            self._qwen3_tts_max_chars = QWEN3TTS_MAX_CHARS_DEFAULT
-        self._qwen3_bridge: Optional[_Qwen3TtsBridgeClient] = None
 
         self._openclaw_enabled = _env_bool("OPENCLAW_ENABLED", True)
         self._openclaw_bin = str(os.getenv("OPENCLAW_BIN", OPENCLAW_BIN_DEFAULT)).strip() or OPENCLAW_BIN_DEFAULT
@@ -1557,14 +1062,13 @@ class SpeechInputWindow(QWidget):
         model: Optional[str] = None,
         timeout_sec: Optional[float] = None,
     ):
-        if provider is not None:
-            self._stt_provider = str(provider or "").strip().lower() or STT_PROVIDER_DEFAULT
+        self._stt_provider = STT_PROVIDER_DEFAULT
         if api_key is not None:
             self._stt_api_key = str(api_key or "").strip()
         if url is not None:
-            self._stt_url = str(url or "").strip()
+            self._stt_url = str(url or "").strip() or GROQ_STT_URL_DEFAULT
         if model is not None:
-            self._stt_model = str(model or "").strip()
+            self._stt_model = str(model or "").strip() or GROQ_STT_MODEL_DEFAULT
         if timeout_sec is not None:
             try:
                 self._stt_timeout_sec = max(5.0, float(timeout_sec))
@@ -1610,107 +1114,6 @@ class SpeechInputWindow(QWidget):
                 self._groq_tts_max_chars = max(32, int(max_chars))
             except Exception:
                 pass
-
-    def set_qwen3tts_config(
-        self,
-        *,
-        enabled: Optional[bool] = None,
-        model: Optional[str] = None,
-        voice: Optional[str] = None,
-        language: Optional[str] = None,
-        instruct: Optional[str] = None,
-        device: Optional[str] = None,
-        dtype: Optional[str] = None,
-        timeout_sec: Optional[float] = None,
-        max_chars: Optional[int] = None,
-        python_bin: Optional[str] = None,
-        conda_env: Optional[str] = None,
-        bridge_script: Optional[str] = None,
-    ):
-        self._tts_provider = "qwen3tts"
-        if enabled is not None:
-            self._tts_enabled = bool(enabled)
-        if model is not None:
-            self._qwen3_tts_model = str(model or "").strip() or QWEN3TTS_MODEL_DEFAULT
-        if voice is not None:
-            self._qwen3_tts_voice = str(voice or "").strip() or QWEN3TTS_VOICE_DEFAULT
-        if language is not None:
-            self._qwen3_tts_language = str(language or "").strip() or QWEN3TTS_LANGUAGE_DEFAULT
-        if instruct is not None:
-            self._qwen3_tts_instruct = str(instruct or "").strip()
-        if device is not None:
-            self._qwen3_tts_device = str(device or "").strip() or QWEN3TTS_DEVICE_DEFAULT
-        if dtype is not None:
-            self._qwen3_tts_dtype = str(dtype or "").strip() or QWEN3TTS_DTYPE_DEFAULT
-        if timeout_sec is not None:
-            try:
-                self._qwen3_tts_timeout_sec = max(5.0, float(timeout_sec))
-            except Exception:
-                pass
-        if max_chars is not None:
-            try:
-                self._qwen3_tts_max_chars = max(32, int(max_chars))
-            except Exception:
-                pass
-        if python_bin is not None:
-            self._qwen3_tts_python = str(python_bin or "").strip()
-        if conda_env is not None:
-            self._qwen3_tts_conda_env = str(conda_env or "").strip()
-        if bridge_script is not None:
-            self._qwen3_tts_bridge_script = str(bridge_script or "").strip() or QWEN3TTS_BRIDGE_SCRIPT_DEFAULT
-        if self._qwen3_bridge is not None:
-            self._qwen3_bridge.update_config(
-                model=self._qwen3_tts_model,
-                voice=self._qwen3_tts_voice,
-                language=self._qwen3_tts_language,
-                instruct=self._qwen3_tts_instruct,
-                device=self._qwen3_tts_device,
-                dtype=self._qwen3_tts_dtype,
-                timeout_sec=self._qwen3_tts_timeout_sec,
-                max_chars=self._qwen3_tts_max_chars,
-                python_bin=self._qwen3_tts_python,
-                conda_env=self._qwen3_tts_conda_env,
-                bridge_script=self._qwen3_tts_bridge_script,
-            )
-
-    def set_kittentts_config(
-        self,
-        *,
-        enabled: Optional[bool] = None,
-        model: Optional[str] = None,
-        voice: Optional[str] = None,
-        timeout_sec: Optional[float] = None,
-        python_bin: Optional[str] = None,
-        conda_env: Optional[str] = None,
-        bridge_script: Optional[str] = None,
-    ):
-        self._tts_provider = "kittentts"
-        if enabled is not None:
-            self._tts_enabled = bool(enabled)
-        if model is not None:
-            self._kitten_tts_model = str(model or "").strip() or KITTENTTS_MODEL_DEFAULT
-        if voice is not None:
-            self._kitten_tts_voice = str(voice or "").strip() or KITTENTTS_VOICE_DEFAULT
-        if timeout_sec is not None:
-            try:
-                self._kitten_tts_timeout_sec = max(5.0, float(timeout_sec))
-            except Exception:
-                pass
-        if python_bin is not None:
-            self._kitten_tts_python = str(python_bin or "").strip()
-        if conda_env is not None:
-            self._kitten_tts_conda_env = str(conda_env or "").strip()
-        if bridge_script is not None:
-            self._kitten_tts_bridge_script = str(bridge_script or "").strip() or KITTENTTS_BRIDGE_SCRIPT_DEFAULT
-        if self._kitten_bridge is not None:
-            self._kitten_bridge.update_config(
-                model=self._kitten_tts_model,
-                voice=self._kitten_tts_voice,
-                timeout_sec=self._kitten_tts_timeout_sec,
-                python_bin=self._kitten_tts_python,
-                conda_env=self._kitten_tts_conda_env,
-                bridge_script=self._kitten_tts_bridge_script,
-            )
 
     def set_openclaw_config(
         self,
@@ -1769,10 +1172,6 @@ class SpeechInputWindow(QWidget):
     def _stop_tts_playback(self, wait_ms: int = 1000):
         worker = self._tts_worker
         if worker is None:
-            try:
-                sd.stop()
-            except Exception:
-                pass
             self._is_tts_running = False
             return
 
@@ -1781,10 +1180,6 @@ class SpeechInputWindow(QWidget):
         except Exception:
             try:
                 worker.requestInterruption()
-            except Exception:
-                pass
-            try:
-                sd.stop()
             except Exception:
                 pass
 
@@ -1796,58 +1191,8 @@ class SpeechInputWindow(QWidget):
         if not worker.isRunning():
             self._tts_worker = None
             self._is_tts_running = False
-
-    def _get_kitten_bridge(self) -> _KittenTtsBridgeClient:
-        if self._kitten_bridge is None:
-            self._kitten_bridge = _KittenTtsBridgeClient(
-                model=self._kitten_tts_model,
-                voice=self._kitten_tts_voice,
-                timeout_sec=self._kitten_tts_timeout_sec,
-                python_bin=self._kitten_tts_python,
-                conda_env=self._kitten_tts_conda_env,
-                bridge_script=self._kitten_tts_bridge_script,
-            )
         else:
-            self._kitten_bridge.update_config(
-                model=self._kitten_tts_model,
-                voice=self._kitten_tts_voice,
-                timeout_sec=self._kitten_tts_timeout_sec,
-                python_bin=self._kitten_tts_python,
-                conda_env=self._kitten_tts_conda_env,
-                bridge_script=self._kitten_tts_bridge_script,
-            )
-        return self._kitten_bridge
-
-    def _get_qwen3_bridge(self) -> _Qwen3TtsBridgeClient:
-        if self._qwen3_bridge is None:
-            self._qwen3_bridge = _Qwen3TtsBridgeClient(
-                model=self._qwen3_tts_model,
-                voice=self._qwen3_tts_voice,
-                language=self._qwen3_tts_language,
-                instruct=self._qwen3_tts_instruct,
-                device=self._qwen3_tts_device,
-                dtype=self._qwen3_tts_dtype,
-                timeout_sec=self._qwen3_tts_timeout_sec,
-                max_chars=self._qwen3_tts_max_chars,
-                python_bin=self._qwen3_tts_python,
-                conda_env=self._qwen3_tts_conda_env,
-                bridge_script=self._qwen3_tts_bridge_script,
-            )
-        else:
-            self._qwen3_bridge.update_config(
-                model=self._qwen3_tts_model,
-                voice=self._qwen3_tts_voice,
-                language=self._qwen3_tts_language,
-                instruct=self._qwen3_tts_instruct,
-                device=self._qwen3_tts_device,
-                dtype=self._qwen3_tts_dtype,
-                timeout_sec=self._qwen3_tts_timeout_sec,
-                max_chars=self._qwen3_tts_max_chars,
-                python_bin=self._qwen3_tts_python,
-                conda_env=self._qwen3_tts_conda_env,
-                bridge_script=self._qwen3_tts_bridge_script,
-            )
-        return self._qwen3_bridge
+            self._is_tts_running = True
 
     def _start_tts(self, reply_text: str):
         text = str(reply_text or "").strip()
@@ -1861,36 +1206,17 @@ class SpeechInputWindow(QWidget):
             return
 
         self._is_tts_running = True
-        if self._tts_provider == "groq":
-            self._tts_worker = _GroqTtsWorker(
-                text=text,
-                api_key=self._groq_api_key,
-                url=self._groq_tts_url,
-                model=self._groq_tts_model,
-                voice=self._groq_tts_voice,
-                response_format=self._groq_tts_response_format,
-                timeout_sec=self._groq_tts_timeout_sec,
-                max_chars=self._groq_tts_max_chars,
-            )
-        elif self._tts_provider == "kittentts":
-            self._tts_worker = _KittenTtsWorker(
-                text=text,
-                bridge=self._get_kitten_bridge(),
-                voice=self._kitten_tts_voice,
-                max_chars=self._groq_tts_max_chars,
-            )
-        elif self._tts_provider == "qwen3tts":
-            self._tts_worker = _Qwen3TtsWorker(
-                text=text,
-                bridge=self._get_qwen3_bridge(),
-                voice=self._qwen3_tts_voice,
-                language=self._qwen3_tts_language,
-                instruct=self._qwen3_tts_instruct,
-                max_chars=self._qwen3_tts_max_chars,
-            )
-        else:
-            self._is_tts_running = False
-            raise ValueError(f"Unsupported TTS provider: {self._tts_provider}")
+        self._tts_provider = TTS_PROVIDER_DEFAULT
+        self._tts_worker = _GroqTtsWorker(
+            text=text,
+            api_key=self._groq_api_key,
+            url=self._groq_tts_url,
+            model=self._groq_tts_model,
+            voice=self._groq_tts_voice,
+            response_format=self._groq_tts_response_format,
+            timeout_sec=self._groq_tts_timeout_sec,
+            max_chars=self._groq_tts_max_chars,
+        )
         self._tts_worker.failed.connect(self._on_tts_failed)
         self._tts_worker.finished.connect(self._on_tts_finished)
         self._tts_worker.start()
@@ -1941,17 +1267,22 @@ class SpeechInputWindow(QWidget):
     def _start_listening(self):
         if self._is_listening or self._is_transcribing:
             return
-        self._stop_tts_playback(wait_ms=500)
+        self._stop_tts_playback(wait_ms=1500)
+        if self._tts_worker is not None and self._tts_worker.isRunning():
+            self._status_text = "语音播报停止中，请稍候再说"
+            self.update()
+            return
         try:
             self._audio_chunks = []
-            self._audio_stream = sd.InputStream(
-                samplerate=self._sample_rate,
-                channels=self._channels,
-                dtype="int16",
-                callback=self._audio_callback,
-                blocksize=0,
-            )
-            self._audio_stream.start()
+            with _AUDIO_IO_LOCK:
+                self._audio_stream = sd.InputStream(
+                    samplerate=self._sample_rate,
+                    channels=self._channels,
+                    dtype="int16",
+                    callback=self._audio_callback,
+                    blocksize=0,
+                )
+                self._audio_stream.start()
         except Exception as exc:
             self._status_text = f"录音启动失败: {exc}"
             self.transcript_failed.emit(self._status_text)
@@ -1971,14 +1302,15 @@ class SpeechInputWindow(QWidget):
         self._set_ripple_active(False)
 
         if self._audio_stream is not None:
-            try:
-                self._audio_stream.stop()
-            except Exception:
-                pass
-            try:
-                self._audio_stream.close()
-            except Exception:
-                pass
+            with _AUDIO_IO_LOCK:
+                try:
+                    self._audio_stream.stop()
+                except Exception:
+                    pass
+                try:
+                    self._audio_stream.close()
+                except Exception:
+                    pass
             self._audio_stream = None
 
         if not self._audio_chunks:
@@ -2012,7 +1344,6 @@ class SpeechInputWindow(QWidget):
 
         self._stt_worker = _SttWorker(
             wav_bytes=wav_bytes,
-            provider=self._stt_provider,
             api_key=self._stt_api_key,
             url=self._stt_url,
             model=self._stt_model,
@@ -2251,17 +1582,5 @@ class SpeechInputWindow(QWidget):
                 pass
             self._openclaw_worker = None
         self._stop_tts_playback(wait_ms=1000)
-        if self._kitten_bridge is not None:
-            try:
-                self._kitten_bridge.close()
-            except Exception:
-                pass
-            self._kitten_bridge = None
-        if self._qwen3_bridge is not None:
-            try:
-                self._qwen3_bridge.close()
-            except Exception:
-                pass
-            self._qwen3_bridge = None
         self.closed.emit()
         super().closeEvent(event)
