@@ -1,0 +1,57 @@
+HF_HOME=
+HUGGINGFACE_HUB_CACHE=
+MODELSCOPE_CACHE=
+
+[dir] /home/sunyuan/.cache/huggingface
+2.6G	/home/sunyuan/.cache/huggingface
+/home/sunyuan/.cache/huggingface/hub
+/home/sunyuan/.cache/huggingface/hub/.locks
+/home/sunyuan/.cache/huggingface/hub/models--KittenML--kitten-tts-nano-0.8
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz
+/home/sunyuan/.cache/huggingface/hub/models--Systran--faster-whisper-small
+/home/sunyuan/.cache/huggingface/hub/models--THUDM--glm-4-voice-tokenizer
+/home/sunyuan/.cache/huggingface/lerobot
+/home/sunyuan/.cache/huggingface/lerobot/calibration
+/home/sunyuan/.cache/huggingface/xet
+/home/sunyuan/.cache/huggingface/xet/https___cas_serv-tGqkUaZf_CBPHQ6h
+/home/sunyuan/.cache/huggingface/xet/logs
+
+[dir] /home/sunyuan/.cache/huggingface/hub
+2.6G	/home/sunyuan/.cache/huggingface/hub
+/home/sunyuan/.cache/huggingface/hub/.locks
+/home/sunyuan/.cache/huggingface/hub/.locks/models--KittenML--kitten-tts-nano-0.8
+/home/sunyuan/.cache/huggingface/hub/.locks/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base
+/home/sunyuan/.cache/huggingface/hub/.locks/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice
+/home/sunyuan/.cache/huggingface/hub/.locks/models--Qwen--Qwen3-TTS-Tokenizer-12Hz
+/home/sunyuan/.cache/huggingface/hub/.locks/models--Systran--faster-whisper-small
+/home/sunyuan/.cache/huggingface/hub/.locks/models--THUDM--glm-4-voice-tokenizer
+/home/sunyuan/.cache/huggingface/hub/models--KittenML--kitten-tts-nano-0.8
+/home/sunyuan/.cache/huggingface/hub/models--KittenML--kitten-tts-nano-0.8/blobs
+/home/sunyuan/.cache/huggingface/hub/models--KittenML--kitten-tts-nano-0.8/refs
+/home/sunyuan/.cache/huggingface/hub/models--KittenML--kitten-tts-nano-0.8/snapshots
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/.no_exist
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/blobs
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/refs
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/blobs
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/refs
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/.no_exist
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/blobs
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/refs
+/home/sunyuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots
+/home/sunyuan/.cache/huggingface/hub/models--Systran--faster-whisper-small
+/home/sunyuan/.cache/huggingface/hub/models--Systran--faster-whisper-small/blobs
+/home/sunyuan/.cache/huggingface/hub/models--Systran--faster-whisper-small/refs
+/home/sunyuan/.cache/huggingface/hub/models--Systran--faster-whisper-small/snapshots
+/home/sunyuan/.cache/huggingface/hub/models--THUDM--glm-4-voice-tokenizer
+/home/sunyuan/.cache/huggingface/hub/models--THUDM--glm-4-voice-tokenizer/.no_exist
+/home/sunyuan/.cache/huggingface/hub/models--THUDM--glm-4-voice-tokenizer/blobs
+/home/sunyuan/.cache/huggingface/hub/models--THUDM--glm-4-voice-tokenizer/refs
+/home/sunyuan/.cache/huggingface/hub/models--THUDM--glm-4-voice-tokenizer/snapshots
+

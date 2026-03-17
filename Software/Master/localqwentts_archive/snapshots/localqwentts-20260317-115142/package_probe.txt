@@ -1,0 +1,7 @@
+qwen_tts=True
+torch=True
+torchaudio=True
+transformers=True
+soundfile=True
+sentencepiece=True
+flash_attn=False

@@ -1,0 +1,84 @@
+
+# >>>>>>>>>>>>>>>>>>>>>> ERROR REPORT <<<<<<<<<<<<<<<<<<<<<<
+
+    Traceback (most recent call last):
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/exceptions.py", line 1003, in __call__
+        return func(*args, **kwargs)
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda_env/cli/main.py", line 73, in do_call
+        exit_code = getattr(module, func_name)(args, parser)
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda_env/cli/main_export.py", line 94, in execute
+        ignore_channels=args.ignore_channels)
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda_env/env.py", line 95, in from_environment
+        precs = tuple(PrefixGraph(pd.iter_records()).graph)
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/core/prefix_data.py", line 117, in iter_records
+        return itervalues(self._prefix_records)
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/core/prefix_data.py", line 146, in _prefix_records
+        return self.__prefix_records or self.load() or self.__prefix_records
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/core/prefix_data.py", line 70, in load
+        self._load_site_packages()
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/core/prefix_data.py", line 261, in _load_site_packages
+        python_record = read_python_record(self.prefix_path, af, python_pkg_record.version)
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/gateways/disk/read.py", line 253, in read_python_record
+        paths_tups = pydist.get_paths()
+      File "/home/sunyuan/miniconda3/lib/python3.7/site-packages/conda/common/pkg_formats/python.py", line 268, in get_paths
+        records = sorted(concatv(records, ((pf, None, None) for pf in missing_pyc_files)))
+    TypeError: '<' not supported between instances of 'str' and 'NoneType'
+
+`$ /home/sunyuan/miniconda3/bin/conda-env export -n localqwentts`
+
+  environment variables:
+        AMENT_PREFIX_PATH=/opt/ros/humble
+                 CIO_TEST=<not set>
+  CONDA_AUTO_UPDATE_CONDA=false
+                CONDA_EXE=/home/sunyuan/miniconda3/bin/conda
+         CONDA_PYTHON_EXE=/home/sunyuan/miniconda3/bin/python
+               CONDA_ROOT=/home/sunyuan/miniconda3
+              CONDA_SHLVL=0
+          FONTCONFIG_PATH=/etc/fonts
+                 GTK_PATH=/snap/code/228/usr/lib/x86_64-linux-gnu/gtk-3.0
+          LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/gazebo-11/plugins:/opt/ros/humble/opt/rviz_o
+                          gre_vendor/lib:/opt/ros/humble/lib/x86_64-linux-
+                          gnu:/opt/ros/humble/lib
+                  LOCPATH=/snap/code/228/usr/lib/locale
+                     PATH=/home/sunyuan/.local/bin:/home/sunyuan/.codex/tmp/arg0/codex-
+                          arg0thPpEy:/home/sunyuan/.local/bin:/home/sunyuan/.npm-global/bin:/hom
+                          e/sunyuan/miniconda3/condabin:/opt/ros/humble/bin:/home/sunyuan/.local
+                          /bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr
+                          /games:/usr/local/games:/snap/bin:/snap/bin:/home/sunyuan/.vscode/exte
+                          nsions/openai.chatgpt-26.313.41514-linux-x64/bin/linux-x86_64
+               PYTHONPATH=/opt/ros/humble/lib/python3.10/site-
+                          packages:/opt/ros/humble/local/lib/python3.10/dist-packages
+       REQUESTS_CA_BUNDLE=<not set>
+        SNAP_LIBRARY_PATH=/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32
+            SSL_CERT_FILE=<not set>
+   VSCODE_CODE_CACHE_PATH=/home/sunyuan/.config/Code/CachedData/61b3d0ab13be7dda2389f1d3e60a119c
+                          7f660cc3
+               WINDOWPATH=2
+
+     active environment : None
+            shell level : 0
+       user config file : /home/sunyuan/.condarc
+ populated config files : /home/sunyuan/.condarc
+          conda version : 4.6.14
+    conda-build version : not installed
+         python version : 3.7.3.final.0
+       base environment : /home/sunyuan/miniconda3  (writable)
+           channel URLs : https://repo.anaconda.com/pkgs/main/linux-64
+                          https://repo.anaconda.com/pkgs/main/noarch
+                          https://repo.anaconda.com/pkgs/free/linux-64
+                          https://repo.anaconda.com/pkgs/free/noarch
+                          https://repo.anaconda.com/pkgs/r/linux-64
+                          https://repo.anaconda.com/pkgs/r/noarch
+          package cache : /home/sunyuan/miniconda3/pkgs
+                          /home/sunyuan/.conda/pkgs
+       envs directories : /home/sunyuan/miniconda3/envs
+                          /home/sunyuan/.conda/envs
+               platform : linux-64
+             user-agent : conda/4.6.14 requests/2.21.0 CPython/3.7.3 Linux/6.8.0-106-generic ubuntu/22.04.5 glibc/2.35
+                UID:GID : 1000:1000
+             netrc file : None
+           offline mode : False
+
+
+An unexpected error has occurred. Conda has prepared the above report.
+

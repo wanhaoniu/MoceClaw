@@ -1,0 +1,20 @@
+timestamp=20260317-115037
+env_name=localqwentts
+hostname=sunyuan-virtual-machine
+kernel=Linux 6.8.0-106-generic x86_64 GNU/Linux
+conda_bin=/home/sunyuan/miniconda3/bin/conda
+pwd=/home/sunyuan/Code/SO-ARM-Moce
+
+[python]
+Python 3.10.4
+
+[torch]
+torch=2.10.0+cu128
+cuda=12.8
+hip=None
+cuda_available=False
+cuda_device_count=0
+python=3.10.4 (main, Mar 31 2022, 08:41:55) [GCC 7.5.0]
+
+[nvidia-smi]
+nvidia-smi not found

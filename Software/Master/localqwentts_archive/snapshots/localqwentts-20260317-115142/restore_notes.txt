@@ -1,0 +1,9 @@
+Restore target: localqwentts
+
+Recommended order on a new Linux system:
+1. Same linux-64 platform: prefer `conda create -n localqwentts --file conda_list_explicit.txt`
+2. If exact recreate is too strict, create a fresh Python 3.10 env first
+3. Install or compare packages from `pip_freeze.txt` and `python_working_set.json`
+4. Treat `conda_env_history.yml` and `conda_env_full.yml` as best-effort exports only
+5. If either Conda export failed, inspect `conda_env_history.stderr.txt` or `conda_env_full.stderr.txt`
+6. Re-download model weights or copy caches listed in `cache_inventory.txt`
