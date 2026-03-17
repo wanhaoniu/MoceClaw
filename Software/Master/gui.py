@@ -63,6 +63,19 @@ def _configure_runtime_environment() -> None:
             if os.path.normpath(path or os.curdir) != normalized_user_site
         ]
 
+    repo_root = Path(__file__).resolve().parents[2]
+    sdk_src = repo_root / "sdk" / "src"
+    if sdk_src.is_dir():
+        sdk_src_str = str(sdk_src)
+        normalized_sdk_src = os.path.normpath(sdk_src_str)
+        sys.path[:] = [
+            path
+            for path in sys.path
+            if os.path.normpath(path or os.curdir) != normalized_sdk_src
+        ]
+        # Keep the packaged SDK ahead of Software/Master/soarmmoce_sdk.py.
+        sys.path.insert(0, sdk_src_str)
+
     pyqt_plugins = (
         Path(sys.prefix)
         / "lib"

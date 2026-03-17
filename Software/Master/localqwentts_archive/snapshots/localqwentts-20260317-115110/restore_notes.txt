@@ -1,8 +1,0 @@
-Restore target: localqwentts
-
-Recommended order on a new Linux system:
-1. conda create -n localqwentts python=3.10
-2. conda env update -n localqwentts -f conda_env_history.yml
-3. Add exact Conda pins if needed from conda_list_explicit.txt
-4. Install remaining pip-only packages from pip_freeze.txt
-5. Re-download model weights or copy caches listed in cache_inventory.txt

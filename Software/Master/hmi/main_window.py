@@ -113,8 +113,15 @@ HEADER_ICON_FILES = {
 SIM_RENDER_SUPERSAMPLE = 1.4
 
 SDK_SRC = REPO_ROOT / "sdk" / "src"
-if SDK_SRC.exists() and str(SDK_SRC) not in sys.path:
-    sys.path.insert(0, str(SDK_SRC))
+if SDK_SRC.exists():
+    _sdk_src_str = str(SDK_SRC)
+    _normalized_sdk_src = os.path.normpath(_sdk_src_str)
+    sys.path[:] = [
+        path
+        for path in sys.path
+        if os.path.normpath(path or os.curdir) != _normalized_sdk_src
+    ]
+    sys.path.insert(0, _sdk_src_str)
 
 if TYPE_CHECKING:
     from soarmmoce_sdk import Robot as SDKRobot

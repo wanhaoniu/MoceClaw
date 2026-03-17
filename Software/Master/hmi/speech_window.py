@@ -20,22 +20,34 @@ import numpy as np
 import requests
 try:
     import sounddevice as sd
-except Exception:
+    _SOUNDDEVICE_IMPORT_ERROR: Optional[Exception] = None
+except Exception as _sounddevice_exc:
     sd = None
+    _SOUNDDEVICE_IMPORT_ERROR = _sounddevice_exc
 from PyQt5.QtCore import QPoint, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QWidget
 from dotenv import dotenv_values, load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+MASTER_ROOT = Path(__file__).resolve().parents[1]
 REPO_DOTENV_PATHS = tuple(
-    path for path in (REPO_ROOT / ".env", REPO_ROOT / "env") if path.exists()
+    path
+    for path in (
+        REPO_ROOT / ".env",
+        REPO_ROOT / "env",
+        MASTER_ROOT / ".env",
+        MASTER_ROOT / "env",
+    )
+    if path.exists()
 )
 for _dotenv_path in REPO_DOTENV_PATHS:
     load_dotenv(dotenv_path=_dotenv_path, override=False)
 
-STT_PROVIDER_DEFAULT = "groq"
-TTS_PROVIDER_DEFAULT = "groq"
+STT_PROVIDER_DEFAULT = "faster-whisper"
+STT_PROVIDER_SUPPORTED = ("groq", "faster-whisper", "openai-compatible", "local")
+TTS_PROVIDER_DEFAULT = "cosyvoice"
+TTS_PROVIDER_SUPPORTED = ("groq", "cosyvoice")
 
 GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL_DEFAULT = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -48,6 +60,19 @@ GROQ_TTS_RESPONSE_FORMAT_DEFAULT = "wav"
 GROQ_TTS_TIMEOUT_SEC_DEFAULT = 45.0
 GROQ_TTS_MAX_CHARS_DEFAULT = 180
 
+COSYVOICE_LOCAL_DIR = REPO_ROOT / "Software" / "Master" / "cosyvoice_local"
+COSYVOICE_TTS_URL_DEFAULT = "http://127.0.0.1:50000"
+COSYVOICE_TTS_MODE_DEFAULT = "zero_shot"
+COSYVOICE_TTS_PROMPT_WAV_DEFAULT = str(COSYVOICE_LOCAL_DIR / "assets" / "zero_shot_prompt.wav")
+COSYVOICE_TTS_ENDOFPROMPT_TOKEN = "<|endofprompt|>"
+COSYVOICE_TTS_TEXT_PREFIX_DEFAULT = f"You are a helpful assistant.{COSYVOICE_TTS_ENDOFPROMPT_TOKEN}"
+COSYVOICE_TTS_INSTRUCT_PREFIX_DEFAULT = "You are a helpful assistant. "
+COSYVOICE_TTS_PROMPT_TEXT_DEFAULT = f"{COSYVOICE_TTS_TEXT_PREFIX_DEFAULT}希望你以后能够做的比我还好呦。"
+COSYVOICE_TTS_INSTRUCT_TEXT_DEFAULT = f"{COSYVOICE_TTS_INSTRUCT_PREFIX_DEFAULT}{COSYVOICE_TTS_ENDOFPROMPT_TOKEN}"
+COSYVOICE_TTS_SAMPLE_RATE_DEFAULT = 24000
+COSYVOICE_TTS_TIMEOUT_SEC_DEFAULT = 90.0
+COSYVOICE_TTS_MAX_CHARS_DEFAULT = 120
+
 OPENCLAW_BIN_DEFAULT = "openclaw"
 OPENCLAW_AGENT_ID_DEFAULT = "main"
 OPENCLAW_TIMEOUT_SEC_DEFAULT = 90.0
@@ -55,6 +80,15 @@ OPENCLAW_SKILL_NAME_DEFAULT = "soarmmoce-control"
 SDK_SRC = REPO_ROOT / "sdk" / "src"
 
 OPENCLAW_THINKING_DEFAULT = "minimal"
+
+
+def _audio_input_unavailable_message() -> str:
+    if sd is not None:
+        return "录音不可用"
+    detail = str(_SOUNDDEVICE_IMPORT_ERROR).strip() if _SOUNDDEVICE_IMPORT_ERROR is not None else ""
+    if detail:
+        return f"录音不可用: sounddevice/PortAudio 未就绪 ({detail})"
+    return "录音不可用: sounddevice/PortAudio 未就绪"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -67,6 +101,47 @@ def _env_bool(name: str, default: bool) -> bool:
     if val in ("0", "false", "no", "off", "n"):
         return False
     return bool(default)
+
+
+def _normalize_tts_provider(value: Optional[str]) -> str:
+    provider = str(value or "").strip().lower() or TTS_PROVIDER_DEFAULT
+    if provider not in TTS_PROVIDER_SUPPORTED:
+        return TTS_PROVIDER_DEFAULT
+    return provider
+
+
+def _normalize_stt_provider(value: Optional[str]) -> str:
+    provider = str(value or "").strip().lower() or STT_PROVIDER_DEFAULT
+    if provider not in STT_PROVIDER_SUPPORTED:
+        return STT_PROVIDER_DEFAULT
+    return provider
+
+
+def _normalize_cosyvoice_mode(value: Optional[str]) -> str:
+    mode = str(value or "").strip().lower() or COSYVOICE_TTS_MODE_DEFAULT
+    if mode not in ("cross_lingual", "zero_shot", "instruct2"):
+        return COSYVOICE_TTS_MODE_DEFAULT
+    return mode
+
+
+def _ensure_cosyvoice3_text_prefix(value: Optional[str], fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    if COSYVOICE_TTS_ENDOFPROMPT_TOKEN in text:
+        return text
+    return f"{COSYVOICE_TTS_TEXT_PREFIX_DEFAULT}{text}"
+
+
+def _ensure_cosyvoice3_instruct_text(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return COSYVOICE_TTS_INSTRUCT_TEXT_DEFAULT
+    if COSYVOICE_TTS_ENDOFPROMPT_TOKEN in text:
+        return text
+    if text.lower().startswith("you are a helpful assistant"):
+        return f"{text}{COSYVOICE_TTS_ENDOFPROMPT_TOKEN}"
+    return f"{COSYVOICE_TTS_INSTRUCT_PREFIX_DEFAULT}{text}{COSYVOICE_TTS_ENDOFPROMPT_TOKEN}"
 
 
 def _runtime_env_values() -> Dict[str, str]:
@@ -411,6 +486,18 @@ def _extract_http_error_message(response: requests.Response, fallback: str) -> s
     return fallback
 
 
+def _format_tts_exception(provider: str, target: str, exc: Exception) -> str:
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        detail = str(exc).strip()
+        message = f"{provider} TTS 服务连接失败: {target}"
+        if detail:
+            message += f"\n详细错误: {detail}"
+        return message
+    if isinstance(exc, requests.exceptions.Timeout):
+        return f"{provider} TTS 请求超时: {target}"
+    return str(exc).strip() or f"{str(provider or '').strip().lower() or 'tts'} failed"
+
+
 def _format_stt_exception(provider: str, url: str, exc: Exception) -> str:
     if isinstance(exc, requests.exceptions.ConnectionError):
         detail = str(exc).strip()
@@ -480,6 +567,29 @@ def _split_text_for_tts(text: str, max_chars: int) -> List[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+def _looks_like_wav_bytes(payload: bytes) -> bool:
+    raw = bytes(payload or b"")
+    return len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"
+
+
+def _wrap_pcm16le_to_wav_bytes(
+    pcm_bytes: bytes,
+    sample_rate: int,
+    channels: int = 1,
+    sample_width: int = 2,
+) -> bytes:
+    raw = bytes(pcm_bytes or b"")
+    if not raw:
+        raise ValueError("TTS response is empty")
+    with io.BytesIO() as buf:
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(max(1, int(channels)))
+            wf.setsampwidth(max(1, int(sample_width)))
+            wf.setframerate(max(8000, int(sample_rate)))
+            wf.writeframes(raw)
+        return buf.getvalue()
+
+
 def _decode_wav_bytes(wav_bytes: bytes) -> Tuple[np.ndarray, int]:
     if not wav_bytes:
         raise ValueError("TTS response is empty")
@@ -524,6 +634,132 @@ def _to_float32_audio_frames(audio: np.ndarray) -> np.ndarray:
     else:
         frames = arr.astype(np.float32, copy=False)
     return np.ascontiguousarray(frames, dtype=np.float32)
+
+
+def _default_input_device_index() -> Optional[int]:
+    if sd is None:
+        return None
+    try:
+        device = sd.default.device
+    except Exception:
+        return None
+    if isinstance(device, (list, tuple)):
+        if not device:
+            return None
+        device = device[0]
+    try:
+        device_index = int(device)
+    except Exception:
+        return None
+    return device_index if device_index >= 0 else None
+
+
+def _available_input_device_indices(min_channels: int = 1) -> List[int]:
+    indices: List[int] = []
+    default_index = _default_input_device_index()
+    if default_index is not None:
+        indices.append(default_index)
+    if sd is None:
+        return indices
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return indices
+
+    for index, info in enumerate(devices):
+        try:
+            max_input_channels = int(info.get("max_input_channels", 0))
+        except Exception:
+            max_input_channels = 0
+        if max_input_channels < max(1, int(min_channels)):
+            continue
+        if index not in indices:
+            indices.append(index)
+    return indices
+
+
+def _resolve_input_stream_settings(
+    target_rate: int,
+    channels: int,
+    dtype: str = "int16",
+) -> Tuple[int, int, str]:
+    if sd is None:
+        raise RuntimeError(_audio_input_unavailable_message())
+
+    last_error: Optional[Exception] = None
+    for device_index in _available_input_device_indices(min_channels=channels):
+        try:
+            device_info = sd.query_devices(device_index, "input")
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        device_name = str(device_info.get("name", f"#{device_index}")).strip() or f"#{device_index}"
+        candidate_rates: List[int] = []
+
+        def _append_rate(value: Any) -> None:
+            try:
+                rate = int(round(float(value)))
+            except Exception:
+                return
+            if rate >= 8000 and rate not in candidate_rates:
+                candidate_rates.append(rate)
+
+        _append_rate(target_rate)
+        _append_rate(device_info.get("default_samplerate"))
+        for fallback_rate in (48000, 44100, 32000, 24000, 22050, 16000, 8000):
+            _append_rate(fallback_rate)
+
+        for rate in candidate_rates:
+            try:
+                sd.check_input_settings(
+                    device=device_index,
+                    samplerate=rate,
+                    channels=max(1, int(channels)),
+                    dtype=dtype,
+                )
+                return device_index, rate, device_name
+            except Exception as exc:
+                last_error = exc
+
+    if _default_input_device_index() is None:
+        prefix = "未找到可用录音设备"
+    else:
+        prefix = "没有找到可用的录音设备采样率"
+    detail = f": {last_error}" if last_error is not None else ""
+    raise RuntimeError(prefix + detail)
+
+
+def _resample_int16_audio(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    arr = np.asarray(audio, dtype=np.int16)
+    if arr.size == 0 or src_rate == dst_rate:
+        return arr
+
+    squeeze = False
+    if arr.ndim == 1:
+        arr = arr[:, None]
+        squeeze = True
+
+    src_frames = int(arr.shape[0])
+    if src_frames <= 1:
+        return arr[:, 0] if squeeze else arr
+
+    dst_frames = max(1, int(round(src_frames * float(dst_rate) / float(src_rate))))
+    src_positions = np.arange(src_frames, dtype=np.float64)
+    dst_positions = np.linspace(0.0, float(src_frames - 1), num=dst_frames, dtype=np.float64)
+
+    out = np.empty((dst_frames, arr.shape[1]), dtype=np.float32)
+    for channel_idx in range(arr.shape[1]):
+        out[:, channel_idx] = np.interp(
+            dst_positions,
+            src_positions,
+            arr[:, channel_idx].astype(np.float32),
+        )
+
+    clipped = np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+    if squeeze:
+        return clipped[:, 0]
+    return clipped
 
 
 def _find_playback_binary(name: str) -> Optional[str]:
@@ -609,6 +845,68 @@ def groq_text_to_speech(
     return response.content
 
 
+def cosyvoice_http_text_to_speech(
+    text: str,
+    base_url: str,
+    mode: str,
+    prompt_wav_path: str,
+    prompt_text: str = "",
+    instruct_text: str = "",
+    sample_rate: int = COSYVOICE_TTS_SAMPLE_RATE_DEFAULT,
+    timeout_sec: float = COSYVOICE_TTS_TIMEOUT_SEC_DEFAULT,
+) -> bytes:
+    content = str(text or "").strip()
+    if not content:
+        raise ValueError("Empty TTS text")
+
+    service_url = str(base_url or "").strip()
+    if not service_url:
+        raise ValueError("Empty CosyVoice service URL")
+
+    req_mode = _normalize_cosyvoice_mode(mode)
+    if re.search(r"/inference_(cross_lingual|zero_shot|instruct2)/?$", service_url):
+        url = service_url.rstrip("/")
+    else:
+        url = f"{service_url.rstrip('/')}/inference_{req_mode}"
+
+    prompt_path = Path(str(prompt_wav_path or "").strip()).expanduser()
+    if req_mode in ("cross_lingual", "zero_shot", "instruct2"):
+        if not prompt_path.is_file():
+            raise FileNotFoundError(f"CosyVoice prompt wav not found: {prompt_path}")
+
+    data: Dict[str, str] = {"tts_text": content}
+    if req_mode == "zero_shot":
+        prompt_text_value = str(prompt_text or "").strip()
+        if not prompt_text_value:
+            raise ValueError("CosyVoice zero_shot mode requires prompt_text")
+        data["prompt_text"] = _ensure_cosyvoice3_text_prefix(
+            prompt_text_value,
+            COSYVOICE_TTS_PROMPT_TEXT_DEFAULT,
+        )
+    elif req_mode == "cross_lingual":
+        data["tts_text"] = _ensure_cosyvoice3_text_prefix(content, content)
+    elif req_mode == "instruct2":
+        data["instruct_text"] = _ensure_cosyvoice3_instruct_text(instruct_text)
+
+    with prompt_path.open("rb") as handle:
+        response = requests.post(
+            url,
+            data=data,
+            files={"prompt_wav": (prompt_path.name, handle, "audio/wav")},
+            timeout=float(timeout_sec),
+            stream=True,
+        )
+        if not response.ok:
+            raise RuntimeError(_extract_http_error_message(response, "CosyVoice TTS failed"))
+        audio_bytes = b"".join(chunk for chunk in response.iter_content(chunk_size=16384) if chunk)
+
+    if not audio_bytes:
+        raise RuntimeError("CosyVoice TTS response is empty")
+    if _looks_like_wav_bytes(audio_bytes):
+        return audio_bytes
+    return _wrap_pcm16le_to_wav_bytes(audio_bytes, sample_rate=sample_rate)
+
+
 def _play_wav_bytes_with_command(wav_bytes: bytes, backend: str, stop_event: Optional[threading.Event] = None):
     stopper = stop_event or threading.Event()
     with tempfile.NamedTemporaryFile(prefix="soarmmoce_tts_", suffix=".wav", delete=False) as handle:
@@ -665,7 +963,7 @@ def _play_wav_bytes_with_command(wav_bytes: bytes, backend: str, stop_event: Opt
 
 def _play_wav_bytes_with_sounddevice(wav_bytes: bytes, stop_event: Optional[threading.Event] = None):
     if sd is None:
-        raise RuntimeError("sounddevice is not available")
+        raise RuntimeError(_audio_input_unavailable_message())
     audio, sample_rate = _decode_wav_bytes(wav_bytes)
     frames = _to_float32_audio_frames(audio)
     if frames.size == 0:
@@ -763,7 +1061,8 @@ def openai_compatible_audio_to_text(
                 files={"file": ("speech.wav", wav_bytes, "audio/wav")},
                 timeout=timeout,
             )
-            response.raise_for_status()
+            if not response.ok:
+                raise RuntimeError(_extract_http_error_message(response, "STT failed"))
 
             try:
                 payload: Any = response.json()
@@ -802,6 +1101,7 @@ class _SttWorker(QThread):
         self,
         *,
         wav_bytes: bytes,
+        provider: str,
         api_key: str,
         url: str,
         model: str,
@@ -810,6 +1110,7 @@ class _SttWorker(QThread):
     ):
         super().__init__()
         self._wav_bytes = wav_bytes
+        self._provider = _normalize_stt_provider(provider)
         self._api_key = api_key
         self._url = url
         self._model = model
@@ -827,7 +1128,7 @@ class _SttWorker(QThread):
                 timeout_sec=self._timeout_sec,
             )
         except Exception as exc:
-            self.failed.emit(_format_stt_exception("groq", self._url, exc))
+            self.failed.emit(_format_stt_exception(self._provider, self._url, exc))
             return
         self.done.emit(text)
 
@@ -888,6 +1189,67 @@ class _GroqTtsWorker(QThread):
         except Exception as exc:
             if not self.isInterruptionRequested():
                 self.failed.emit(str(exc))
+
+
+class _CosyVoiceTtsWorker(QThread):
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        text: str,
+        base_url: str,
+        mode: str,
+        prompt_wav_path: str,
+        prompt_text: str,
+        instruct_text: str,
+        sample_rate: int,
+        timeout_sec: float,
+        max_chars: int,
+        playback_backend: str = "auto",
+    ):
+        super().__init__()
+        self._text = str(text or "").strip()
+        self._base_url = str(base_url or "").strip() or COSYVOICE_TTS_URL_DEFAULT
+        self._mode = _normalize_cosyvoice_mode(mode)
+        self._prompt_wav_path = str(prompt_wav_path or "").strip() or COSYVOICE_TTS_PROMPT_WAV_DEFAULT
+        self._prompt_text = str(prompt_text or "").strip() or COSYVOICE_TTS_PROMPT_TEXT_DEFAULT
+        self._instruct_text = str(instruct_text or "").strip() or COSYVOICE_TTS_INSTRUCT_TEXT_DEFAULT
+        self._sample_rate = max(8000, int(sample_rate))
+        self._timeout_sec = max(5.0, float(timeout_sec))
+        self._max_chars = max(32, int(max_chars))
+        self._playback_backend = str(playback_backend or "auto").strip() or "auto"
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self.requestInterruption()
+        self._stop_event.set()
+
+    def run(self):
+        try:
+            chunks = _split_text_for_tts(self._text, self._max_chars)
+            if not chunks:
+                raise ValueError("Empty TTS text")
+            for chunk in chunks:
+                if self.isInterruptionRequested():
+                    return
+                wav_bytes = cosyvoice_http_text_to_speech(
+                    text=chunk,
+                    base_url=self._base_url,
+                    mode=self._mode,
+                    prompt_wav_path=self._prompt_wav_path,
+                    prompt_text=self._prompt_text,
+                    instruct_text=self._instruct_text,
+                    sample_rate=self._sample_rate,
+                    timeout_sec=self._timeout_sec,
+                )
+                if self.isInterruptionRequested():
+                    return
+                play_wav_bytes(wav_bytes, self._stop_event, backend=self._playback_backend)
+                if self.isInterruptionRequested():
+                    return
+        except Exception as exc:
+            if not self.isInterruptionRequested():
+                self.failed.emit(_format_tts_exception("CosyVoice", self._base_url, exc))
 
 
 class _OpenClawAgentWorker(QThread):
@@ -1134,6 +1496,9 @@ class SpeechInputWindow(QWidget):
         self._last_agent_reply = ""
 
         self._sample_rate = 16000
+        self._capture_sample_rate = self._sample_rate
+        self._audio_input_device: Optional[int] = None
+        self._audio_input_device_name = ""
         self._channels = 1
         self._audio_stream: Optional[sd.InputStream] = None
         self._audio_chunks: List[np.ndarray] = []
@@ -1141,24 +1506,47 @@ class SpeechInputWindow(QWidget):
         self._openclaw_worker: Optional[_OpenClawAgentWorker] = None
         self._tts_worker: Optional[QThread] = None
 
-        self._stt_provider = STT_PROVIDER_DEFAULT
-        self._stt_api_key = str(
-            os.getenv("SOARMMOCE_STT_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-            or GROQ_API_KEY_FALLBACK
-            or ""
-        ).strip()
-        self._stt_url = os.getenv("GROQ_STT_URL", GROQ_STT_URL_DEFAULT).strip() or GROQ_STT_URL_DEFAULT
-        self._stt_model = os.getenv("GROQ_STT_MODEL", GROQ_STT_MODEL_DEFAULT).strip() or GROQ_STT_MODEL_DEFAULT
+        self._stt_provider = _normalize_stt_provider(
+            _runtime_env_get("SOARMMOCE_STT_PROVIDER", STT_PROVIDER_DEFAULT, runtime_env)
+        )
+        stt_api_key = _runtime_env_get("SOARMMOCE_STT_API_KEY", None, runtime_env)
+        if stt_api_key is None:
+            stt_api_key = (
+                _runtime_env_get("GROQ_API_KEY", None, runtime_env)
+                or GROQ_API_KEY_FALLBACK
+                or ""
+            )
+        self._stt_api_key = str(stt_api_key).strip()
+        self._stt_url = (
+            _runtime_env_get("SOARMMOCE_STT_URL", None, runtime_env)
+            or _runtime_env_get("GROQ_STT_URL", None, runtime_env)
+            or GROQ_STT_URL_DEFAULT
+        ).strip() or GROQ_STT_URL_DEFAULT
+        self._stt_model = (
+            _runtime_env_get("SOARMMOCE_STT_MODEL", None, runtime_env)
+            or _runtime_env_get("GROQ_STT_MODEL", None, runtime_env)
+            or GROQ_STT_MODEL_DEFAULT
+        ).strip() or GROQ_STT_MODEL_DEFAULT
+        self._stt_language = (
+            _runtime_env_get("SOARMMOCE_STT_LANGUAGE", None, runtime_env)
+            or _runtime_env_get("GROQ_STT_LANGUAGE", None, runtime_env)
+            or "zh"
+        ).strip() or "zh"
         try:
             self._stt_timeout_sec = float(
-                str(os.getenv("SOARMMOCE_STT_TIMEOUT_SEC", "45.0")).strip()
+                str(
+                    _runtime_env_get("SOARMMOCE_STT_TIMEOUT_SEC", None, runtime_env)
+                    or _runtime_env_get("GROQ_STT_TIMEOUT_SEC", None, runtime_env)
+                    or "45.0"
+                ).strip()
             )
         except Exception:
             self._stt_timeout_sec = 45.0
         self._stt_timeout_sec = max(5.0, self._stt_timeout_sec)
 
-        self._tts_provider = TTS_PROVIDER_DEFAULT
+        self._tts_provider = _normalize_tts_provider(
+            _runtime_env_get("SOARMMOCE_TTS_PROVIDER", TTS_PROVIDER_DEFAULT, runtime_env)
+        )
         self._tts_enabled = _runtime_env_bool("SOARMMOCE_TTS_ENABLED", True, runtime_env)
         self._groq_api_key = str(
             _runtime_env_get("SOARMMOCE_TTS_API_KEY", None, runtime_env)
@@ -1217,6 +1605,70 @@ class SpeechInputWindow(QWidget):
         self._tts_playback_backend = (
             _runtime_env_get("SOARMMOCE_TTS_PLAYBACK_BACKEND", "auto", runtime_env) or "auto"
         ).strip() or "auto"
+        self._cosyvoice_tts_url = (
+            _runtime_env_get("SOARMMOCE_COSYVOICE_URL", None, runtime_env)
+            or _runtime_env_get("COSYVOICE_TTS_URL", None, runtime_env)
+            or COSYVOICE_TTS_URL_DEFAULT
+        ).strip() or COSYVOICE_TTS_URL_DEFAULT
+        self._cosyvoice_tts_mode = _normalize_cosyvoice_mode(
+            _runtime_env_get("SOARMMOCE_COSYVOICE_MODE", None, runtime_env)
+            or _runtime_env_get("COSYVOICE_TTS_MODE", None, runtime_env)
+            or COSYVOICE_TTS_MODE_DEFAULT
+        )
+        self._cosyvoice_tts_prompt_wav = str(
+            _runtime_env_get("SOARMMOCE_COSYVOICE_PROMPT_WAV", None, runtime_env)
+            or _runtime_env_get("COSYVOICE_TTS_PROMPT_WAV", None, runtime_env)
+            or COSYVOICE_TTS_PROMPT_WAV_DEFAULT
+        ).strip() or COSYVOICE_TTS_PROMPT_WAV_DEFAULT
+        self._cosyvoice_tts_prompt_text = str(
+            _runtime_env_get("SOARMMOCE_COSYVOICE_PROMPT_TEXT", None, runtime_env)
+            or _runtime_env_get("COSYVOICE_TTS_PROMPT_TEXT", None, runtime_env)
+            or COSYVOICE_TTS_PROMPT_TEXT_DEFAULT
+        ).strip() or COSYVOICE_TTS_PROMPT_TEXT_DEFAULT
+        self._cosyvoice_tts_instruct_text = str(
+            _runtime_env_get("SOARMMOCE_COSYVOICE_INSTRUCT_TEXT", None, runtime_env)
+            or _runtime_env_get("COSYVOICE_TTS_INSTRUCT_TEXT", None, runtime_env)
+            or COSYVOICE_TTS_INSTRUCT_TEXT_DEFAULT
+        ).strip() or COSYVOICE_TTS_INSTRUCT_TEXT_DEFAULT
+        try:
+            self._cosyvoice_tts_sample_rate = max(
+                8000,
+                int(
+                    str(
+                        _runtime_env_get("SOARMMOCE_COSYVOICE_SAMPLE_RATE", None, runtime_env)
+                        or _runtime_env_get("COSYVOICE_TTS_SAMPLE_RATE", None, runtime_env)
+                        or str(COSYVOICE_TTS_SAMPLE_RATE_DEFAULT)
+                    ).strip()
+                ),
+            )
+        except Exception:
+            self._cosyvoice_tts_sample_rate = COSYVOICE_TTS_SAMPLE_RATE_DEFAULT
+        try:
+            self._cosyvoice_tts_timeout_sec = float(
+                str(
+                    _runtime_env_get("SOARMMOCE_COSYVOICE_TIMEOUT_SEC", None, runtime_env)
+                    or _runtime_env_get("COSYVOICE_TTS_TIMEOUT_SEC", None, runtime_env)
+                    or _runtime_env_get("SOARMMOCE_TTS_TIMEOUT_SEC", None, runtime_env)
+                    or str(COSYVOICE_TTS_TIMEOUT_SEC_DEFAULT)
+                ).strip()
+            )
+        except Exception:
+            self._cosyvoice_tts_timeout_sec = COSYVOICE_TTS_TIMEOUT_SEC_DEFAULT
+        self._cosyvoice_tts_timeout_sec = max(5.0, self._cosyvoice_tts_timeout_sec)
+        try:
+            self._cosyvoice_tts_max_chars = max(
+                32,
+                int(
+                    str(
+                        _runtime_env_get("SOARMMOCE_COSYVOICE_MAX_CHARS", None, runtime_env)
+                        or _runtime_env_get("COSYVOICE_TTS_MAX_CHARS", None, runtime_env)
+                        or _runtime_env_get("SOARMMOCE_TTS_MAX_CHARS", None, runtime_env)
+                        or str(COSYVOICE_TTS_MAX_CHARS_DEFAULT)
+                    ).strip()
+                ),
+            )
+        except Exception:
+            self._cosyvoice_tts_max_chars = COSYVOICE_TTS_MAX_CHARS_DEFAULT
 
         self._openclaw_enabled = _env_bool("OPENCLAW_ENABLED", True)
         self._openclaw_bin = str(os.getenv("OPENCLAW_BIN", OPENCLAW_BIN_DEFAULT)).strip() or OPENCLAW_BIN_DEFAULT
@@ -1274,15 +1726,18 @@ class SpeechInputWindow(QWidget):
         api_key: Optional[str] = None,
         url: Optional[str] = None,
         model: Optional[str] = None,
+        language: Optional[str] = None,
         timeout_sec: Optional[float] = None,
     ):
-        self._stt_provider = STT_PROVIDER_DEFAULT
+        self._stt_provider = _normalize_stt_provider(provider or STT_PROVIDER_DEFAULT)
         if api_key is not None:
             self._stt_api_key = str(api_key or "").strip()
         if url is not None:
             self._stt_url = str(url or "").strip() or GROQ_STT_URL_DEFAULT
         if model is not None:
             self._stt_model = str(model or "").strip() or GROQ_STT_MODEL_DEFAULT
+        if language is not None:
+            self._stt_language = str(language or "").strip() or "zh"
         if timeout_sec is not None:
             try:
                 self._stt_timeout_sec = max(5.0, float(timeout_sec))
@@ -1295,6 +1750,7 @@ class SpeechInputWindow(QWidget):
     def set_groq_tts_config(
         self,
         enabled: Optional[bool] = None,
+        provider: Optional[str] = None,
         api_key: Optional[str] = None,
         url: Optional[str] = None,
         model: Optional[str] = None,
@@ -1303,7 +1759,7 @@ class SpeechInputWindow(QWidget):
         timeout_sec: Optional[float] = None,
         max_chars: Optional[int] = None,
     ):
-        self._tts_provider = "groq"
+        self._tts_provider = _normalize_tts_provider(provider or "groq")
         if enabled is not None:
             self._tts_enabled = bool(enabled)
         if api_key is not None:
@@ -1326,6 +1782,54 @@ class SpeechInputWindow(QWidget):
         if max_chars is not None:
             try:
                 self._groq_tts_max_chars = max(32, int(max_chars))
+            except Exception:
+                pass
+
+    def set_cosyvoice_tts_config(
+        self,
+        enabled: Optional[bool] = None,
+        provider: Optional[str] = None,
+        url: Optional[str] = None,
+        mode: Optional[str] = None,
+        prompt_wav: Optional[str] = None,
+        prompt_text: Optional[str] = None,
+        instruct_text: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        timeout_sec: Optional[float] = None,
+        max_chars: Optional[int] = None,
+    ):
+        self._tts_provider = _normalize_tts_provider(provider or "cosyvoice")
+        if enabled is not None:
+            self._tts_enabled = bool(enabled)
+        if url is not None:
+            self._cosyvoice_tts_url = str(url or "").strip() or COSYVOICE_TTS_URL_DEFAULT
+        if mode is not None:
+            self._cosyvoice_tts_mode = _normalize_cosyvoice_mode(mode)
+        if prompt_wav is not None:
+            self._cosyvoice_tts_prompt_wav = (
+                str(prompt_wav or "").strip() or COSYVOICE_TTS_PROMPT_WAV_DEFAULT
+            )
+        if prompt_text is not None:
+            self._cosyvoice_tts_prompt_text = (
+                str(prompt_text or "").strip() or COSYVOICE_TTS_PROMPT_TEXT_DEFAULT
+            )
+        if instruct_text is not None:
+            self._cosyvoice_tts_instruct_text = (
+                str(instruct_text or "").strip() or COSYVOICE_TTS_INSTRUCT_TEXT_DEFAULT
+            )
+        if sample_rate is not None:
+            try:
+                self._cosyvoice_tts_sample_rate = max(8000, int(sample_rate))
+            except Exception:
+                pass
+        if timeout_sec is not None:
+            try:
+                self._cosyvoice_tts_timeout_sec = max(5.0, float(timeout_sec))
+            except Exception:
+                pass
+        if max_chars is not None:
+            try:
+                self._cosyvoice_tts_max_chars = max(32, int(max_chars))
             except Exception:
                 pass
 
@@ -1420,25 +1924,49 @@ class SpeechInputWindow(QWidget):
             return
 
         self._is_tts_running = True
-        self._tts_provider = TTS_PROVIDER_DEFAULT
-        _log_tts(
-            "start "
-            f"url={self._groq_tts_url} "
-            f"model={self._groq_tts_model} "
-            f"voice={self._groq_tts_voice} "
-            f"backend={self._tts_playback_backend}"
-        )
-        self._tts_worker = _GroqTtsWorker(
-            text=text,
-            api_key=self._groq_api_key,
-            url=self._groq_tts_url,
-            model=self._groq_tts_model,
-            voice=self._groq_tts_voice,
-            response_format=self._groq_tts_response_format,
-            timeout_sec=self._groq_tts_timeout_sec,
-            max_chars=self._groq_tts_max_chars,
-            playback_backend=self._tts_playback_backend,
-        )
+        provider = _normalize_tts_provider(self._tts_provider)
+        self._tts_provider = provider
+        if provider == "cosyvoice":
+            _log_tts(
+                "start "
+                f"provider=cosyvoice "
+                f"url={self._cosyvoice_tts_url} "
+                f"mode={self._cosyvoice_tts_mode} "
+                f"prompt_wav={self._cosyvoice_tts_prompt_wav} "
+                f"backend={self._tts_playback_backend}"
+            )
+            self._tts_worker = _CosyVoiceTtsWorker(
+                text=text,
+                base_url=self._cosyvoice_tts_url,
+                mode=self._cosyvoice_tts_mode,
+                prompt_wav_path=self._cosyvoice_tts_prompt_wav,
+                prompt_text=self._cosyvoice_tts_prompt_text,
+                instruct_text=self._cosyvoice_tts_instruct_text,
+                sample_rate=self._cosyvoice_tts_sample_rate,
+                timeout_sec=self._cosyvoice_tts_timeout_sec,
+                max_chars=self._cosyvoice_tts_max_chars,
+                playback_backend=self._tts_playback_backend,
+            )
+        else:
+            _log_tts(
+                "start "
+                f"provider=groq "
+                f"url={self._groq_tts_url} "
+                f"model={self._groq_tts_model} "
+                f"voice={self._groq_tts_voice} "
+                f"backend={self._tts_playback_backend}"
+            )
+            self._tts_worker = _GroqTtsWorker(
+                text=text,
+                api_key=self._groq_api_key,
+                url=self._groq_tts_url,
+                model=self._groq_tts_model,
+                voice=self._groq_tts_voice,
+                response_format=self._groq_tts_response_format,
+                timeout_sec=self._groq_tts_timeout_sec,
+                max_chars=self._groq_tts_max_chars,
+                playback_backend=self._tts_playback_backend,
+            )
         self._tts_worker.failed.connect(self._on_tts_failed)
         self._tts_worker.finished.connect(self._on_tts_finished)
         self._tts_worker.start()
@@ -1494,11 +2022,26 @@ class SpeechInputWindow(QWidget):
             self._status_text = "语音播报停止中，请稍候再说"
             self.update()
             return
+        if sd is None:
+            self._status_text = _audio_input_unavailable_message()
+            self.transcript_failed.emit(self._status_text)
+            self.update()
+            return
         try:
             self._audio_chunks = []
+            (
+                self._audio_input_device,
+                self._capture_sample_rate,
+                self._audio_input_device_name,
+            ) = _resolve_input_stream_settings(
+                self._sample_rate,
+                self._channels,
+                dtype="int16",
+            )
             with _AUDIO_IO_LOCK:
                 self._audio_stream = sd.InputStream(
-                    samplerate=self._sample_rate,
+                    device=self._audio_input_device,
+                    samplerate=self._capture_sample_rate,
                     channels=self._channels,
                     dtype="int16",
                     callback=self._audio_callback,
@@ -1542,6 +2085,9 @@ class SpeechInputWindow(QWidget):
 
         audio = np.concatenate(self._audio_chunks, axis=0)
         self._audio_chunks = []
+        capture_rate = int(self._capture_sample_rate or self._sample_rate)
+        if capture_rate != self._sample_rate:
+            audio = _resample_int16_audio(audio, capture_rate, self._sample_rate)
         with io.BytesIO() as buf:
             with wave.open(buf, "wb") as wf:
                 wf.setnchannels(self._channels)
@@ -1566,10 +2112,11 @@ class SpeechInputWindow(QWidget):
 
         self._stt_worker = _SttWorker(
             wav_bytes=wav_bytes,
+            provider=self._stt_provider,
             api_key=self._stt_api_key,
             url=self._stt_url,
             model=self._stt_model,
-            language="zh",
+            language=self._stt_language,
             timeout_sec=self._stt_timeout_sec,
         )
         self._stt_worker.done.connect(self._on_stt_done)

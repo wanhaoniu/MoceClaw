@@ -1,2 +1,0 @@
-# Fallback export: this conda version does not support --from-history.
-# Generated with: conda env export --no-builds

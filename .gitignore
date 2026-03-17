@@ -12,4 +12,6 @@ Software/Slave/recordings_local
 sdk/build/
 sdk/dist/
 .env
-
+.bin
+faster_whisper_local/
+cosyvoice_local/
