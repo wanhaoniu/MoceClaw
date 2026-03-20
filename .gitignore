@@ -16,3 +16,5 @@ sdk/dist/
 faster_whisper_local/
 cosyvoice_local/
 .venv/
+.vscode/
+*.jpg

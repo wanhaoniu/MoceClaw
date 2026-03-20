@@ -6,7 +6,7 @@ from pathlib import Path
 if sys.version_info < (3, 10):
     raise SystemExit(
         "gesture_loc requires Python 3.10+. "
-        "Use: PYTHONNOUSERSITE=1 /home/sunyuan/miniconda3/envs/gestureloc/bin/python "
+        "Use: PYTHONNOUSERSITE=1 conda run -n gestureloc python "
         "Software/Master/gesture_loc/main.py --config Software/Master/gesture_loc/configs/default.yaml"
     )
 

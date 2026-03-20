@@ -23,6 +23,17 @@ The MediaPipe canned gesture recognizer can emit gestures such as:
 
 ## Run the service
 
+Create a dedicated conda env first:
+
+```bash
+cd /home/ubuntu/Code/MoceClaw/Software/Master/gesture_loc
+source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
+conda env create -f environment.yml -n gestureloc
+conda activate gestureloc
+```
+
+`gesture_loc` is better isolated from `face_loc`: both use Python 3.10, but hand-tracking adds MediaPipe and its own OpenCV wheel set.
+
 ```bash
 PYTHONNOUSERSITE=1 conda run -n gestureloc python Software/Master/gesture_loc/main.py \
   --config Software/Master/gesture_loc/configs/default.yaml
@@ -37,9 +48,11 @@ curl http://127.0.0.1:8012/latest | jq
 ## Run gesture actions
 
 ```bash
-PYTHONNOUSERSITE=1 conda run -n localqwentts python Software/Master/gesture_loc/scripts/gesture_action_runner.py \
+PYTHONNOUSERSITE=1 /home/ubuntu/anaconda3/bin/python Software/Master/gesture_loc/scripts/gesture_action_runner.py \
   --config Software/Master/gesture_loc/configs/actions.default.yaml
 ```
+
+`gesture_action_runner.py` imports the local `soarmmoce_sdk`, so it should run in an SDK-ready Python with `draccus`, `kinpy`, `lerobot`, and `pyserial` available. The bundled `/home/ubuntu/anaconda3/bin/python` already has those installed on this machine.
 
 ## Notes
 

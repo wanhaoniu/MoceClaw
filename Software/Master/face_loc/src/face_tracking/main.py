@@ -5,12 +5,16 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 
 import uvicorn
 
 from face_tracking.config import AppConfig, load_config
 from face_tracking.logging_utils import setup_logging
 from face_tracking.service import SkillService, create_app
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
 
 
 def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
@@ -38,14 +42,14 @@ def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfi
         config.visualizer.enabled = False
     if args.host:
         config.service.host = args.host
-    if args.port:
+    if args.port is not None:
         config.service.port = args.port
     return config
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Smart mirror face tracking service")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config file")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to YAML config file")
     parser.add_argument("--source-type", choices=["camera", "rtsp", "video_file", "capture"])
     parser.add_argument("--camera-index", type=int)
     parser.add_argument("--rtsp-url")
@@ -56,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--host")
-    parser.add_argument("--port", type=int)
+    parser.add_argument("--port", type=int, default=8011)
     parser.add_argument("--show-gui", action="store_true")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--print-config", action="store_true")

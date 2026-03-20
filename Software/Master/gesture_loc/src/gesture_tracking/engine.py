@@ -20,7 +20,31 @@ from gesture_tracking.source import OpenCvFrameSource
 
 
 LOGGER = logging.getLogger(__name__)
-HAND_CONNECTIONS = tuple(mp.solutions.hands.HAND_CONNECTIONS)
+
+# Keep overlay drawing independent from MediaPipe's optional solutions package.
+HAND_CONNECTIONS = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+)
 
 
 class FpsMeter:
@@ -145,7 +169,10 @@ class GestureTrackingEngine:
             return
 
         options = vision.GestureRecognizerOptions(
-            base_options=python.BaseOptions(model_asset_path=str(model_path)),
+            base_options=python.BaseOptions(
+                model_asset_path=str(model_path),
+                delegate=python.BaseOptions.Delegate.CPU,
+            ),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=int(self.config.recognizer.num_hands),
             min_hand_detection_confidence=float(self.config.recognizer.min_hand_detection_confidence),
@@ -178,6 +205,7 @@ class GestureTrackingEngine:
         frame = packet.frame
         frame_height, frame_width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = np.ascontiguousarray(rgb_frame, dtype=np.uint8)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         timestamp_ms = int(packet.timestamp * 1000.0)
         result = recognizer.recognize_for_video(mp_image, timestamp_ms)
