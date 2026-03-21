@@ -22,8 +22,8 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "workspace" / "picture"
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_DIR = SKILL_ROOT / "workspace" / "picture"
 DEFAULT_CAMERA_DEVICE = "/dev/video2"
 DEFAULT_CAMERA_WIDTH = 1280
 DEFAULT_CAMERA_HEIGHT = 720

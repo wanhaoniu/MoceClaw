@@ -25,8 +25,8 @@ from urdfpy import URDF
 from soarmmoce_sdk import DEFAULT_MODEL_OFFSETS_DEG
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_URDF_PATH = REPO_ROOT / "sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf"
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_URDF_PATH = SKILL_ROOT / "resources" / "urdf" / "soarmoce_urdf.urdf"
 SDK_TO_URDF_JOINT = {
     "shoulder_pan": "shoulder",
     "shoulder_lift": "shoulder_lift",

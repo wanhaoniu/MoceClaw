@@ -21,8 +21,10 @@ from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+RESOURCE_ROOT = SKILL_ROOT / "resources"
+DEFAULT_CALIB_DIR = SKILL_ROOT / "calibration"
+DEFAULT_URDF_PATH = RESOURCE_ROOT / "urdf" / "soarmoce_urdf.urdf"
 JOINTS = [
     "shoulder_pan",
     "shoulder_lift",
@@ -194,16 +196,7 @@ def _candidate_calibration_dirs() -> list[Path]:
     candidates: list[Path] = []
     if env:
         candidates.append(Path(env).expanduser())
-    candidates.extend(
-        [
-            SKILL_ROOT / "calibration",
-            Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower",
-            REPO_ROOT / "Software/Slave/calibration/robots/so101_follower",
-            REPO_ROOT / "Software/Master/calibration/robots/so101_follower",
-            Path.cwd() / "Software/Slave/calibration/robots/so101_follower",
-            Path.home() / "Code/SO-ARM-Moce/Software/Slave/calibration/robots/so101_follower",
-        ]
-    )
+    candidates.append(DEFAULT_CALIB_DIR)
     unique: list[Path] = []
     seen: set[str] = set()
     for path in candidates:
@@ -254,13 +247,7 @@ def _candidate_urdf_paths() -> list[Path]:
     candidates: list[Path] = []
     if env:
         candidates.append(Path(env).expanduser())
-    candidates.extend(
-        [
-            REPO_ROOT / "sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf",
-            Path.cwd() / "sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf",
-            Path.home() / "Code/SO-ARM-Moce/sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf",
-        ]
-    )
+    candidates.append(DEFAULT_URDF_PATH)
     unique: list[Path] = []
     seen: set[str] = set()
     for path in candidates:

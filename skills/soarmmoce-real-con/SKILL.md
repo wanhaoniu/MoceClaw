@@ -16,6 +16,7 @@ metadata:
 - 代码结构分成两层：
   - `scripts/soarmmoce_sdk.py`：SDK 风格控制逻辑
   - `scripts/soarmmoce_state.py` / `scripts/soarmmoce_move.py`：命令行入口
+- 技能包内已自带运行所需的 `resources/urdf` 和 `resources/meshes`，默认不再依赖仓库根目录里的 SDK 资源。
 - 当前 TCP 笛卡尔控制按 `5DOF position-only IK` 工作，只解末端位置 `x/y/z`，不再强行约束完整 6D 姿态。
 - 对 `delta/xyz` 这类笛卡尔移动，默认锁住 `wrist_flex + wrist_roll`，避免 4/5 号在只解 `xyz` 时自己乱补姿态。
 - 轨迹下发默认按时间频率连续插值，并使用平滑缓入缓出，避免单步跳变太大导致动作发卡。
@@ -152,10 +153,10 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 
 - `SOARMMOCE_PORT`：串口，默认 `/dev/ttyACM0`
 - `SOARMMOCE_ROBOT_ID`：标定 ID，默认优先 `soarmmoce`，找不到再回退 `follower_moce`
-- `SOARMMOCE_CALIB_DIR`：标定目录
-- `SOARMMOCE_URDF_PATH`：URDF 路径，默认优先使用 `sdk/src/soarmmoce_sdk/resources/urdf/soarmoce_urdf.urdf`
+- `SOARMMOCE_CALIB_DIR`：标定目录，默认使用 `skills/soarmmoce-real-con/calibration`
+- `SOARMMOCE_URDF_PATH`：URDF 路径，默认使用 `skills/soarmmoce-real-con/resources/urdf/soarmoce_urdf.urdf`
 - `SOARMMOCE_TARGET_FRAME`：末端 frame，默认 `wrist_roll`（按当前 5DOF 链截断）
-- `SOARMMOCE_JOINT_SCALE_JSON`：覆盖关节减速比/方向，默认 `{"shoulder_pan":1.0,"shoulder_lift":5.3,"elbow_flex":-5.6,"wrist_flex":1.0,"wrist_roll":1.0}`
+- `SOARMMOCE_JOINT_SCALE_JSON`：覆盖关节减速比/方向，默认 `{"shoulder_pan":-1.0,"shoulder_lift":-5.3,"elbow_flex":5.6,"wrist_flex":1.0,"wrist_roll":1.0}`
 - `SOARMMOCE_MODEL_OFFSETS_JSON`：覆盖 URDF 模型角度偏置，默认 `{"shoulder_pan":0.0,"shoulder_lift":0.0,"elbow_flex":0.0,"wrist_flex":0.0,"wrist_roll":0.0}`
 - `SOARMMOCE_LINEAR_STEP_M`：笛卡尔插值步长，默认 `0.01`
 - `SOARMMOCE_JOINT_STEP_DEG`：关节插值步长，默认 `5.0`
@@ -197,4 +198,6 @@ PYTHONPATH=~/.openclaw/skills/soarmmoce-real-con/scripts python3 /tmp/soarmmoce_
 - `skills/soarmmoce-real-con/scripts/soarmmoce_state.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_diag_ik.py`
 - `skills/soarmmoce-real-con/scripts/soarmmoce_move.py`
+- `skills/soarmmoce-real-con/resources/urdf/soarmoce_urdf.urdf`
+- `skills/soarmmoce-real-con/resources/meshes`
 - `skills/soarmmoce-real-con/agents/openai.yaml`

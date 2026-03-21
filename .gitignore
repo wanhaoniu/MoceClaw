@@ -18,3 +18,5 @@ cosyvoice_local/
 .venv/
 .vscode/
 *.jpg
+autograsp/
+

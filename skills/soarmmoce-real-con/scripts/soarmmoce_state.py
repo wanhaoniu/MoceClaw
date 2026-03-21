@@ -17,7 +17,8 @@ from soarmmoce_cli_common import run_and_print
 from soarmmoce_sdk import DEFAULT_MODEL_OFFSETS_DEG, SoArmMoceController
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+REFERENCE_SO101_URDF_PATH = SKILL_ROOT / "resources" / "references" / "so101.urdf"
 DEFAULT_OFFSETS_DEG = dict(DEFAULT_MODEL_OFFSETS_DEG)
 
 
@@ -88,7 +89,7 @@ def diagnose_model(offsets_deg: Dict[str, float]) -> Dict[str, Any]:
     offsets_vec = np.array([float(offsets_deg.get(name, 0.0)) for name in active_joint_names], dtype=float)
     active_offset_report = _chain_report(active_chain, q_deg + offsets_vec, active_joint_names)
 
-    so101_path = REPO_ROOT / "Software" / "Master" / "so101.urdf"
+    so101_path = REFERENCE_SO101_URDF_PATH
     so101_report = None
     if so101_path.exists():
         so101_chain = _build_chain(so101_path, "gripper_frame_link")
