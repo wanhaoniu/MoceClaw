@@ -45,6 +45,7 @@ MULTI_TURN_SETTLE_TOL_DEG = 0.5
 MULTI_TURN_SETTLE_MAX_ITERS = 6
 MULTI_TURN_SETTLE_WAIT_S = 0.08
 DEFAULT_MULTI_TURN_HOME_TOLERANCE_RAW = 96.0
+DEFAULT_MULTI_TURN_HOME_RECOVER_MAX_DELTA_RAW = 768.0
 DEFAULT_HOME_JOINTS = {
     "shoulder_pan": 0.0,
     "shoulder_lift": 0.0,
@@ -613,6 +614,26 @@ class SoArmMoceController:
             return max(0.0, float(entry["home_tolerance_raw"]))
         return float(DEFAULT_MULTI_TURN_HOME_TOLERANCE_RAW)
 
+    def _describe_multi_turn_home_alignment(
+        self,
+        raw_motor: Dict[str, int | float],
+    ) -> Dict[str, Dict[str, float]]:
+        alignment: Dict[str, Dict[str, float]] = {}
+        for name in MULTI_TURN_JOINTS:
+            raw_mod = self._normalize_raw_mod(self._require_raw_present_position(raw_motor, name))
+            home_raw = self._multi_turn_home_wrapped_raw(name)
+            delta_raw = self._raw_mod_delta(raw_mod, home_raw)
+            delta_motor_deg = float(delta_raw) * 360.0 / RAW_COUNTS_PER_REV
+            alignment[name] = {
+                "current_raw_mod": float(raw_mod),
+                "home_wrapped_raw": float(home_raw),
+                "delta_raw": float(delta_raw),
+                "delta_motor_deg": float(delta_motor_deg),
+                "delta_joint_deg": float(self._motor_to_joint_deg(name, delta_motor_deg)),
+                "tolerance_raw": float(self._multi_turn_home_tolerance_raw(name)),
+            }
+        return alignment
+
     def _load_persisted_multi_turn_session(self) -> Dict[str, Any]:
         path = self._multi_turn_session_path()
         if not path.exists():
@@ -697,28 +718,26 @@ class SoArmMoceController:
     def init_multi_turn_home(self) -> Dict[str, Any]:
         bus = self._ensure_bus()
         raw_motor = self._read_present_position_raw_map(bus)
-        raw_mod_by_joint = {
-            name: self._normalize_raw_mod(self._require_raw_present_position(raw_motor, name))
-            for name in MULTI_TURN_JOINTS
-        }
-        home_delta_raw: Dict[str, float] = {}
-        tolerance_raw: Dict[str, float] = {}
+        alignment = self._describe_multi_turn_home_alignment(raw_motor)
+        raw_mod_by_joint = {name: float(info["current_raw_mod"]) for name, info in alignment.items()}
+        home_delta_raw: Dict[str, float] = {name: float(info["delta_raw"]) for name, info in alignment.items()}
+        tolerance_raw: Dict[str, float] = {name: float(info["tolerance_raw"]) for name, info in alignment.items()}
         violations: list[str] = []
-        for name, raw_mod in raw_mod_by_joint.items():
-            home_raw = self._multi_turn_home_wrapped_raw(name)
-            delta_raw = self._raw_mod_delta(raw_mod, home_raw)
-            tol_raw = self._multi_turn_home_tolerance_raw(name)
-            home_delta_raw[name] = float(delta_raw)
-            tolerance_raw[name] = float(tol_raw)
+        for name, info in alignment.items():
+            delta_raw = float(info["delta_raw"])
+            tol_raw = float(info["tolerance_raw"])
             if abs(delta_raw) > tol_raw:
                 violations.append(
-                    f"{name}: current_raw_mod={raw_mod:.1f}, home_wrapped_raw={home_raw:.1f}, "
-                    f"delta_raw={delta_raw:.1f}, tolerance_raw={tol_raw:.1f}"
+                    f"{name}: current_raw_mod={info['current_raw_mod']:.1f}, "
+                    f"home_wrapped_raw={info['home_wrapped_raw']:.1f}, "
+                    f"delta_raw={delta_raw:.1f}, tolerance_raw={tol_raw:.1f}, "
+                    f"delta_joint_deg={info['delta_joint_deg']:.2f}"
                 )
         if violations:
             raise ValidationError(
                 "Current multi-turn pose is not close enough to calibrated home to initialize the runtime session:\n"
                 + "\n".join(violations)
+                + "\nIf the arm is already near home, try 'init_home --recover' first."
             )
 
         self._multi_turn_state = {
@@ -737,12 +756,63 @@ class SoArmMoceController:
             "multi_turn_session": self._multi_turn_session_info(),
             "home_delta_raw": home_delta_raw,
             "tolerance_raw": tolerance_raw,
+            "home_alignment": alignment,
             "multi_turn_state": self._snapshot_multi_turn_state(),
             "state": state,
         }
 
     def zero_multi_turn_here(self) -> Dict[str, Any]:
         return self.init_multi_turn_home()
+
+    def recover_multi_turn_home(
+        self,
+        *,
+        duration: float = 1.0,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+        max_delta_raw: float = DEFAULT_MULTI_TURN_HOME_RECOVER_MAX_DELTA_RAW,
+    ) -> Dict[str, Any]:
+        bus = self._ensure_bus()
+        raw_before = self._read_raw_present_position(bus)
+        alignment_before = self._describe_multi_turn_home_alignment(raw_before)
+        max_delta_raw = max(0.0, float(max_delta_raw))
+
+        violations: list[str] = []
+        for name, info in alignment_before.items():
+            delta_raw = float(info["delta_raw"])
+            if abs(delta_raw) > max_delta_raw:
+                violations.append(
+                    f"{name}: delta_raw={delta_raw:.1f}, delta_joint_deg={info['delta_joint_deg']:.2f}, "
+                    f"recover_limit_raw={max_delta_raw:.1f}"
+                )
+        if violations:
+            raise ValidationError(
+                "Current multi-turn pose is too far from calibrated home for automatic recovery:\n"
+                + "\n".join(violations)
+            )
+
+        hold_cmd = self._build_raw_hold_command(bus)
+        for name, info in alignment_before.items():
+            hold_cmd[name] = float(int(round(info["home_wrapped_raw"])))
+        if hold_cmd:
+            bus.sync_write("Goal_Position", hold_cmd)
+        self._wait(duration, wait, timeout)
+
+        raw_after = self._read_raw_present_position(bus)
+        alignment_after = self._describe_multi_turn_home_alignment(raw_after)
+        state = self.get_state()
+        return {
+            "action": "recover_multi_turn_home",
+            "message": "Moved multi-turn joints toward the calibrated home pose using wrapped raw targets",
+            "recover_limit_raw": float(max_delta_raw),
+            "before_alignment": alignment_before,
+            "after_alignment": alignment_after,
+            "raw_present_position_before": raw_before,
+            "raw_present_position_after": raw_after,
+            "raw_present_position_delta": self._raw_delta(raw_before, raw_after),
+            "multi_turn_state": self._snapshot_multi_turn_state(),
+            "state": state,
+        }
 
     def get_state(self) -> Dict[str, Any]:
         bus = self._ensure_bus()

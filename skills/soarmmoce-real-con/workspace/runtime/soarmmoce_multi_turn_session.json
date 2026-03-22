@@ -3,18 +3,18 @@
   "valid": true,
   "robot_id": "soarmmoce",
   "source": "init_home",
-  "initialized_at": 1774110126.359008,
-  "updated_at": 1774145225.1782432,
+  "initialized_at": 1774155299.812337,
+  "updated_at": 1774155323.143362,
   "joints": {
     "shoulder_lift": {
-      "zero_raw_mod": 2735.0,
-      "last_raw_mod": 2761.0,
-      "continuous_raw": 26.0
+      "zero_raw_mod": 2877.0,
+      "last_raw_mod": 2877.0,
+      "continuous_raw": 0.0
     },
     "elbow_flex": {
-      "zero_raw_mod": 1522.0,
-      "last_raw_mod": 1511.0,
-      "continuous_raw": -11.0
+      "zero_raw_mod": 1939.0,
+      "last_raw_mod": 1939.0,
+      "continuous_raw": 0.0
     }
   }
 }

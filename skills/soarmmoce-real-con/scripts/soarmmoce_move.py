@@ -61,8 +61,31 @@ def main() -> None:
     p_home.add_argument("--timeout", type=float, default=None)
     p_home.add_argument("--trace", action="store_true")
 
-    sub.add_parser("init_home", help="Initialize the multi-turn runtime session from the calibrated home pose")
-    sub.add_parser("zero", help="Deprecated alias for init_home")
+    p_init_home = sub.add_parser("init_home", help="Initialize the multi-turn runtime session from the calibrated home pose")
+    p_init_home.add_argument(
+        "--recover",
+        action="store_true",
+        help="If direct init_home fails because the arm is only approximately at home, first move multi-turn joints toward calibrated home",
+    )
+    p_init_home.add_argument(
+        "--duration",
+        type=float,
+        default=1.0,
+        help="Recovery move duration in seconds when --recover is used",
+    )
+    p_init_home.add_argument("--timeout", type=float, default=None)
+    p_init_home.add_argument(
+        "--recover-max-delta-raw",
+        type=float,
+        default=768.0,
+        help="Abort recovery if any multi-turn joint is farther than this wrapped raw delta from calibrated home",
+    )
+
+    p_zero = sub.add_parser("zero", help="Deprecated alias for init_home")
+    p_zero.add_argument("--recover", action="store_true")
+    p_zero.add_argument("--duration", type=float, default=1.0)
+    p_zero.add_argument("--timeout", type=float, default=None)
+    p_zero.add_argument("--recover-max-delta-raw", type=float, default=768.0)
     sub.add_parser("stop", help="Hold current pose")
 
     args = parser.parse_args()
@@ -115,7 +138,17 @@ def main() -> None:
         elif args.cmd == "home":
             result = arm.home(duration=args.duration, wait=args.wait, timeout=args.timeout, trace=args.trace)
         elif args.cmd in {"init_home", "zero"}:
-            result = arm.init_multi_turn_home()
+            if bool(getattr(args, "recover", False)):
+                recovery = arm.recover_multi_turn_home(
+                    duration=float(getattr(args, "duration", 1.0)),
+                    wait=True,
+                    timeout=getattr(args, "timeout", None),
+                    max_delta_raw=float(getattr(args, "recover_max_delta_raw", 768.0)),
+                )
+                result = arm.init_multi_turn_home()
+                result["recovery"] = recovery
+            else:
+                result = arm.init_multi_turn_home()
         else:
             result = arm.stop()
         print_success(result)

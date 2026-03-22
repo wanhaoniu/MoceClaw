@@ -97,6 +97,14 @@ python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py joint --
 python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py init_home
 ```
 
+如果机械臂已经大致摆回 home，但直接 `init_home` 仍然报 “not close enough to calibrated home”，可以先走自动恢复：
+
+```bash
+python3 ~/.openclaw/skills/soarmmoce-real-con/scripts/soarmmoce_move.py init_home --recover
+```
+
+这条命令会先把 2/3 号多圈关节按标定 JSON 里的 `home_wrapped_raw` 拉回去，再立即初始化本次运行的 session。
+
 只有执行过这一步，后面的 `home` / `delta` / `xyz` 和多圈关节控制才会生效。
 
 ### 6) 回零

@@ -89,6 +89,23 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _clear_runtime_multi_turn_cache(runtime_dir: Path, robot_id: str) -> Dict[str, bool]:
+    runtime_dir = Path(runtime_dir).expanduser().resolve()
+    cleared: Dict[str, bool] = {}
+    for suffix in ("multi_turn_session", "multi_turn_state"):
+        path = runtime_dir / f"{robot_id}_{suffix}.json"
+        removed = False
+        try:
+            path.unlink()
+            removed = True
+        except FileNotFoundError:
+            removed = False
+        except Exception:
+            removed = False
+        cleared[str(path)] = removed
+    return cleared
+
+
 def _wrap_position_raw(raw_value: int | float) -> int:
     return int(raw_value) % RAW_COUNTS_PER_REV
 
@@ -671,11 +688,13 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                     bus.write("Min_Position_Limit", joint, int(write_spec["range_min"]), normalize=False)
                     bus.write("Max_Position_Limit", joint, int(write_spec["range_max"]), normalize=False)
 
+            cleared_runtime_cache: Dict[str, bool] = {}
             if args.save_json:
                 written_json[CALIBRATION_META_KEY] = {
                     "home_joint_deg": {joint: 0.0 for joint in JOINTS},
                 }
                 _write_json(output_path, written_json)
+                cleared_runtime_cache = _clear_runtime_multi_turn_cache(config.runtime_dir, config.robot_id)
 
             return {
                 "action": "auto_calibrate",
@@ -686,6 +705,7 @@ def _calibrate(args: argparse.Namespace) -> Dict[str, Any]:
                 "saved_json": bool(args.save_json),
                 "applied_registers": bool(args.apply_registers),
                 "home_reference_note": "place single-turn joints at the URDF q=0 pose before running; multi-turn joints use the current pose as software zero",
+                "runtime_cache_cleared": cleared_runtime_cache,
                 "thresholds": {
                     "velocity_abs_threshold": float(args.velocity_abs_threshold),
                     "movement_abs_threshold": int(args.movement_abs_threshold),

@@ -17,6 +17,7 @@ from soarmmoce_auto_calibrate import (
     MultiTurnTrackerState,
     _build_multi_turn_calibration_entry,
     _build_single_turn_calibration_entry,
+    _clear_runtime_multi_turn_cache,
     _parse_joints,
     _read_joint_snapshot,
     _read_json,
@@ -527,11 +528,13 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
             bus.disable_torque()
             _apply_selected_calibration(bus, joints, written_json)
 
+        cleared_runtime_cache: Dict[str, bool] = {}
         if robot_cfg.save_json:
             written_json[CALIBRATION_META_KEY] = {
                 "home_joint_deg": {joint: 0.0 for joint in JOINTS},
             }
             _write_json(output_path, written_json)
+            cleared_runtime_cache = _clear_runtime_multi_turn_cache(runtime_config.runtime_dir, target_robot_id)
 
         return {
             "action": "manual_calibrate",
@@ -549,6 +552,7 @@ def _manual_calibrate(cfg: ManualCalibrateConfig) -> Dict[str, Any]:
             "home_reference_note": "single-turn joints use the URDF q=0 pose; multi-turn joints use the captured pose as software zero",
             "single_turn_note": "single-turn joints use the LeRobot half-turn zero plus manual range recording with torque disabled",
             "multi_turn_note": "multi-turn joints store home_wrapped_raw plus relative continuous raw limits recorded with software unwrap in position mode",
+            "runtime_cache_cleared": cleared_runtime_cache,
             "results": results,
             "register_writes": register_writes,
         }
